@@ -53,6 +53,16 @@ const API_REGION_MAP: Record<string, string> = {
   "eu-south-1": "eu-central-1",
   "eu-south-2": "eu-central-1",
   "eu-central-2": "eu-central-1",
+  "ap-northeast-1": "us-east-1",
+  "ap-northeast-2": "us-east-1",
+  "ap-northeast-3": "us-east-1",
+  "ap-southeast-1": "us-east-1",
+  "ap-southeast-2": "us-east-1",
+  "ap-south-1": "us-east-1",
+  "ap-east-1": "us-east-1",
+  "ap-south-2": "us-east-1",
+  "ap-southeast-3": "us-east-1",
+  "ap-southeast-4": "us-east-1",
 };
 
 export function resolveApiRegion(ssoRegion: string | undefined): string {
