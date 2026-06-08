@@ -586,19 +586,9 @@ export function streamKiro(
           }
         }
 
-        // If Pi hides thinking, tell Kiro to omit it, otherwise ask Kiro to stream it.
-        // If options.reasoning is "off" or missing, we don't necessarily want adaptive thinking.
-        // But if thinkingEnabled is true, we want to ensure it streams.
-        if (supportsThinkingConfig && thinkingEnabled) {
-          // In Pi, if reasoning is enabled but UI hides it, options.reasoning is still a string (effort level).
-          // Wait, Pi UI hide thinking toggle is pure UI. So we always want Kiro to stream it ("summarized")
-          // so Pi can see the blocks and hide them in the UI if needed!
-          request.additionalModelRequestFields!.thinking = {
-            type: "adaptive",
-            display: "summarized",
-          };
-          log.debug("thinking.set", { type: "adaptive", display: "summarized", model: model.id });
-        }
+        // We no longer explicitly send the `thinking` block configuration.
+        // Sending `display: "summarized"` was found to cause Kiro's backend
+        // to stop streaming the reasoning tokens to us entirely.
 
         // -- HTTP request with capacity-retry inner loop -----------------
         // Emit `start` and arm the hidden-reasoning countdown. The
