@@ -53,14 +53,22 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
     return { type: "content", data: parsed.content as string };
   }
 
-  if (parsed.reasoningText !== undefined) {
-    const rt = parsed.reasoningText as Record<string, unknown>;
+  if (parsed.reasoningText !== undefined || parsed.signature !== undefined || (parsed.text !== undefined && !parsed.content && !parsed.name && !parsed.message)) {
+    let text = "";
+    let signature: string | undefined;
+
+    if (parsed.reasoningText) {
+      const rt = parsed.reasoningText as Record<string, unknown>;
+      text = ((rt.text ?? rt.Text) || "") as string;
+      signature = (rt.signature ?? rt.Signature) as string | undefined;
+    } else {
+      text = (parsed.text as string) || "";
+      signature = parsed.signature as string | undefined;
+    }
+
     return {
       type: "reasoning",
-      data: {
-        text: ((rt.text ?? rt.Text) || "") as string,
-        signature: (rt.signature ?? rt.Signature) as string | undefined,
-      },
+      data: { text, signature },
     };
   }
 
@@ -140,6 +148,8 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
 const EVENT_PATTERNS = [
   '{"content":',
   '{"reasoningText":',
+  '{"signature":',
+  '{"text":',
   '{"name":',
   '{"input":',
   '{"stop":',

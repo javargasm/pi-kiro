@@ -521,13 +521,43 @@ export function streamKiro(
         };
         if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
         if (context.tools?.length) {
-          uimc.tools = context.tools.map(t => ({
-            toolSpecification: {
-              name: t.name,
-              description: t.description,
-              inputSchema: { json: t.parameters as Record<string, unknown> }
+          // Bedrock / Amazon Q strict schema requirements:
+          // 1. No $schema
+          // 2. No additionalProperties anywhere
+          // 3. No empty required arrays
+          const deepCleanSchema = (obj: any): any => {
+            if (Array.isArray(obj)) {
+              return obj.map(deepCleanSchema);
+            } else if (obj !== null && typeof obj === "object") {
+              const cleaned: any = {};
+              for (const [k, v] of Object.entries(obj)) {
+                if (k === "$schema" || k === "additionalProperties") continue;
+                if (k === "required" && Array.isArray(v) && v.length === 0) continue;
+                cleaned[k] = deepCleanSchema(v);
+              }
+              return cleaned;
             }
-          }));
+            return obj;
+          };
+
+          uimc.tools = context.tools.map((t) => {
+            const params = deepCleanSchema(t.parameters) as Record<string, any>;
+            // Bedrock / Amazon Q often expects __tool_use_purpose in properties.
+            // We'll inject it just in case it's a hard requirement, though it might not be.
+            if (params.properties) {
+              params.properties.__tool_use_purpose = {
+                type: "string",
+                description: "A brief explanation why you are making this tool use.",
+              };
+            }
+            return {
+              toolSpecification: {
+                name: t.name,
+                description: t.description || `Use ${t.name}`,
+                inputSchema: { json: params },
+              },
+            };
+          });
         }
 
         if (firstMsg?.role === "user") {
@@ -586,9 +616,14 @@ export function streamKiro(
           }
         }
 
-        // We no longer explicitly send the `thinking` block configuration.
-        // Sending `display: "summarized"` was found to cause Kiro's backend
-        // to stop streaming the reasoning tokens to us entirely.
+        // Request the adaptive thinking block so that Kiro streams the reasoning text.
+        if (supportsThinkingConfig && thinkingEnabled) {
+          request.additionalModelRequestFields!.thinking = {
+            type: "adaptive",
+            display: "summarized",
+          };
+          log.debug("thinking.set", { type: "adaptive", display: "summarized", model: model.id });
+        }
 
         // -- HTTP request with capacity-retry inner loop -----------------
         // Emit `start` and arm the hidden-reasoning countdown. The
@@ -865,17 +900,23 @@ export function streamKiro(
               }
               case "reasoning": {
                 // Native reasoning event from Kiro (Opus 4.7+).
-                // Emit as a complete Pi thinking block.
+                // Accumulate chunks into a single Pi thinking block.
                 cancelHiddenShim();
-                const thinkIdx = output.content.length;
-                const thinkBlock: ThinkingContent = {
-                  type: "thinking",
-                  thinking: event.data.text,
-                };
-                output.content.push(thinkBlock);
-                stream.push({ type: "thinking_start", contentIndex: thinkIdx, partial: output });
-                stream.push({ type: "thinking_delta", contentIndex: thinkIdx, delta: event.data.text, partial: output });
-                stream.push({ type: "thinking_end", contentIndex: thinkIdx, content: event.data.text, partial: output });
+                if (output.content.length === 0 || output.content[output.content.length - 1]?.type !== "thinking") {
+                  output.content.push({ type: "thinking", thinking: "" });
+                  stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+                }
+                const contentIndex = output.content.length - 1;
+                const tc = output.content[contentIndex] as ThinkingContent;
+                if (event.data.text) {
+                  tc.thinking += event.data.text;
+                  stream.push({ type: "thinking_delta", contentIndex, delta: event.data.text, partial: output });
+                }
+                if (event.data.signature) {
+                  tc.thinkingSignature = event.data.signature;
+                  // Signature indicates the end of the reasoning block.
+                  // Pi engine automatically handles the final state, but we could emit thinking_end here if needed.
+                }
                 break;
               }
               case "content": {
