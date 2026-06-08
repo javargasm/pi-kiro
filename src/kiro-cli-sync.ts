@@ -203,3 +203,108 @@ export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
     return null;
   }
 }
+
+/**
+ * Attempt to read credentials from Kiro IDE's local database WITHOUT checking
+ * token expiry. This is the last-resort fallback: the access token is probably
+ * stale, but the refresh token might still be valid for one more exchange.
+ *
+ * Returns null if the DB doesn't exist, is unreadable, or has no tokens at all.
+ * Never throws.
+ */
+export async function getKiroCliCredentialsAllowExpired(): Promise<KiroCliCredentials | null> {
+  // Delegate to the same DB reader — importFromKiroCli already returns
+  // whatever token is stored without validating expiry timestamps.
+  // This separate export exists so callers express intent ("I know the token
+  // may be expired, give it to me anyway") and future refactors can add
+  // expiry-gating to importFromKiroCli without breaking the fallback path.
+  return importFromKiroCli();
+}
+
+/**
+ * Write refreshed credentials back to Kiro IDE's local SQLite database.
+ *
+ * This enables bidirectional sync: when pi-kiro refreshes a token, the new
+ * credentials are persisted back to the Kiro CLI DB so both tools stay in sync.
+ *
+ * The function updates the FIRST `:token` entry found in `auth_kv` — matching
+ * the same read pattern used by `importFromKiroCli`.
+ *
+ * Never throws — all errors are caught and logged. A failed write-back is
+ * non-fatal; the refreshed token is still valid in memory.
+ */
+export async function saveKiroCliCredentials(creds: KiroCliCredentials): Promise<boolean> {
+  const dbPath = getKiroDbPath();
+  if (!existsSync(dbPath)) {
+    log.debug(`Kiro CLI DB not found at ${dbPath} — cannot save credentials`);
+    return false;
+  }
+
+  try {
+    let Database: any;
+    try {
+      Database = (await import("bun:sqlite")).Database;
+    } catch {
+      try {
+        // @ts-expect-error - better-sqlite3 is an optional peer dependency
+        Database = (await import("better-sqlite3")).default;
+      } catch {
+        log.debug("No SQLite driver available for credential write-back");
+        return false;
+      }
+    }
+
+    // Open in read-write mode (no `readonly` flag).
+    const db = new Database(dbPath);
+
+    try {
+      db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
+    } catch {
+      // Some SQLite drivers use exec instead of run
+    }
+
+    // Find the existing token key to update.
+    let rows: Array<{ key: string; value: string }>;
+    try {
+      const stmt = db.prepare("SELECT key, value FROM auth_kv");
+      rows = stmt.all() as Array<{ key: string; value: string }>;
+    } catch {
+      log.debug("Failed to read auth_kv table for credential write-back");
+      try { db.close(); } catch { /* ignore */ }
+      return false;
+    }
+
+    const tokenRow = rows.find((r) => r.key.includes(":token"));
+    if (!tokenRow) {
+      log.debug("No token entry found in auth_kv — cannot write back");
+      try { db.close(); } catch { /* ignore */ }
+      return false;
+    }
+
+    // Parse existing value, merge updated fields, write back.
+    const existing = safeJsonParse(tokenRow.value) ?? {};
+    const updated = {
+      ...existing,
+      accessToken: creds.accessToken,
+      access_token: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      refresh_token: creds.refreshToken,
+    };
+
+    try {
+      const updateStmt = db.prepare("UPDATE auth_kv SET value = ? WHERE key = ?");
+      updateStmt.run(JSON.stringify(updated), tokenRow.key);
+    } catch (err) {
+      log.warn(`Failed to write credentials back to Kiro CLI DB: ${err}`);
+      try { db.close(); } catch { /* ignore */ }
+      return false;
+    }
+
+    try { db.close(); } catch { /* ignore */ }
+    log.info("Wrote refreshed credentials back to Kiro CLI DB");
+    return true;
+  } catch (err) {
+    log.warn(`Failed to save credentials to Kiro CLI: ${err}`);
+    return false;
+  }
+}

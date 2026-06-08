@@ -604,21 +604,19 @@ export function streamKiro(
         const supportedEfforts = staticModel?.supportedEfforts ?? dynamicModel?.supportedEfforts;
         const supportsThinkingConfig = staticModel?.supportsThinkingConfig ?? dynamicModel?.supportsThinkingConfig;
         
-        if (supportsThinkingConfig || supportedEfforts) {
-          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
-        }
-
         if (supportedEfforts && supportedEfforts.length > 0 && options?.reasoning && typeof options.reasoning === "string") {
           const kiroEffort = EFFORT_MAP[options.reasoning];
           if (kiroEffort && supportedEfforts.includes(kiroEffort)) {
-            request.additionalModelRequestFields!.output_config = { effort: kiroEffort };
+            request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+            request.additionalModelRequestFields.output_config = { effort: kiroEffort };
             log.debug("effort.set", { piReasoning: options.reasoning, kiroEffort, model: model.id });
           }
         }
 
         // Request the adaptive thinking block so that Kiro streams the reasoning text.
         if (supportsThinkingConfig && thinkingEnabled) {
-          request.additionalModelRequestFields!.thinking = {
+          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+          request.additionalModelRequestFields.thinking = {
             type: "adaptive",
             display: "summarized",
           };
@@ -876,7 +874,13 @@ export function streamKiro(
           }
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
-          resetIdle();
+
+          // Only reset the idle timer when real events arrive — raw byte
+          // reads (keepalive framing, partial chunks) must NOT prevent the
+          // idle timeout from firing. Without this guard, the API's
+          // keepalive framing resets the timer on every chunk, causing
+          // potentially infinite stream hangs.
+          if (events.length > 0) resetIdle();
 
           if (log.isDebug() && events.length > 0) {
             for (const ev of events) {

@@ -31,6 +31,7 @@ import {
   resolveApiRegion,
   setCachedDynamicModels,
 } from "./models";
+import type { KiroCliCredentials } from "./kiro-cli-sync";
 
 export const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 export const BUILDER_ID_REGION = "us-east-1";
@@ -434,43 +435,67 @@ async function runDeviceCodeFlow(
   };
 }
 
-export async function refreshKiroToken(
-  credentials: OAuthCredentials,
-): Promise<KiroCredentials> {
+/**
+ * Sync refreshed credentials back to the Kiro CLI DB.
+ * Fire-and-forget — a failed write-back is non-fatal.
+ */
+async function syncBackToKiroCli(result: KiroCredentials): Promise<void> {
+  try {
+    const { saveKiroCliCredentials } = await import("./kiro-cli-sync");
+    const synced = await saveKiroCliCredentials({
+      accessToken: result.access,
+      refreshToken: result.refresh.split("|")[0] ?? "",
+      region: result.region,
+      authMethod: result.authMethod === "builder-id" ? "idc" : result.authMethod,
+    });
+    if (synced) log.info("Synced refreshed credentials back to Kiro CLI DB");
+  } catch (err) {
+    log.debug(`Credential sync-back skipped: ${err}`);
+  }
+}
+
+/**
+ * Build KiroCredentials from a KiroCliCredentials import.
+ * Used by the fallback layers of the refresh cascade.
+ */
+function kiroCredsFromCliImport(imported: KiroCliCredentials): KiroCredentials {
+  const authMethod: "builder-id" | "idc" | "desktop" =
+    imported.authMethod === "idc" ? "idc" : "desktop";
+  const refreshPacked = imported.clientId
+    ? `${imported.refreshToken}|${imported.clientId}|${imported.clientSecret ?? ""}|${authMethod}`
+    : `${imported.refreshToken}|||desktop`;
+
+  return {
+    refresh: refreshPacked,
+    access: imported.accessToken,
+    expires: Date.now() + 3600 * 1000 - EXPIRES_BUFFER_MS,
+    clientId: imported.clientId ?? "",
+    clientSecret: imported.clientSecret ?? "",
+    region: imported.region,
+    authMethod,
+  };
+}
+
+/**
+ * Core token refresh against the appropriate endpoint (OIDC or desktop).
+ * This is the "inner" refresh — extracted so the cascade can call it
+ * with different credential sets.
+ *
+ * Throws on failure (caller catches and falls through to next layer).
+ */
+async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCredentials> {
   const parts = credentials.refresh.split("|");
   const refreshToken = parts[0] ?? "";
-  const clientId = parts[1] ?? "";
-  const clientSecret = parts[2] ?? "";
-  const region = (credentials as KiroCredentials).region;
-  // Preserve whatever authMethod came in. Fall back to "idc" only for
-  // pre-existing credentials written before this field was tracked; never
-  // invent "builder-id" because we can't tell the difference retroactively.
-  const inputMethod = (credentials as Partial<KiroCredentials>).authMethod;
-  const authMethod: "builder-id" | "idc" | "desktop" =
-    inputMethod === "builder-id" || inputMethod === "idc" || inputMethod === "desktop"
-      ? inputMethod
-      : "idc";
-  if (
-    inputMethod !== undefined &&
-    inputMethod !== "builder-id" &&
-    inputMethod !== "idc" &&
-    inputMethod !== "desktop"
-  ) {
-    // Corrupt or migrated-badly credential. Refresh still works because both
-    // methods hit the same endpoint, but future code branching on authMethod
-    // would get the wrong answer.
-    log.warn(`refreshKiroToken: unrecognized authMethod "${String(inputMethod)}" — defaulting to "idc"`);
-  }
+  const clientId = parts[1] ?? credentials.clientId ?? "";
+  const clientSecret = parts[2] ?? credentials.clientSecret ?? "";
+  const region = credentials.region;
+  const authMethod = credentials.authMethod;
 
   if (!refreshToken || !region) {
-    throw new Error(
-      "Refresh token is missing region — re-login required",
-    );
+    throw new Error("Refresh token is missing region — re-login required");
   }
   if (authMethod !== "desktop" && (!clientId || !clientSecret)) {
-    throw new Error(
-      "Refresh token is missing clientId/clientSecret — re-login required",
-    );
+    throw new Error("Refresh token is missing clientId/clientSecret — re-login required");
   }
 
   // Desktop auth uses Kiro's own auth endpoint (no OIDC client required).
@@ -483,9 +508,6 @@ export async function refreshKiroToken(
     });
     if (!resp.ok) {
       const body = await resp.text().catch(() => "");
-      if (isPermanentError(body)) {
-        throw new Error(`Kiro desktop auth permanently invalid — re-login required: ${body}`);
-      }
       throw new Error(`Desktop token refresh failed: ${resp.status} ${body}`);
     }
 
@@ -523,9 +545,6 @@ export async function refreshKiroToken(
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
-    if (isPermanentError(body)) {
-      throw new Error(`Kiro auth permanently invalid — re-login required: ${body}`);
-    }
     throw new Error(`Token refresh failed: ${resp.status} ${body}`);
   }
 
@@ -547,13 +566,139 @@ export async function refreshKiroToken(
   return {
     refresh: `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
     access: data.accessToken,
-    // Mirror loginKiro: fall back to 1h if the server omits expiresIn. Without
-    // this guard a missing field yields `expires: NaN`, which compares false
-    // against every timestamp and forces a refresh on every subsequent call.
     expires: Date.now() + (data.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
     clientId,
     clientSecret,
     region,
     authMethod,
   };
+}
+
+/**
+ * 5-layer credential refresh cascade.
+ *
+ * Layers (each falls through to the next on failure):
+ *   1. Normal OIDC/desktop refresh with current credentials
+ *   2. Import fresh credentials from Kiro CLI DB → use as-is
+ *   3. Import fresh credentials from Kiro CLI DB → refresh those
+ *   4. Import expired credentials from Kiro CLI DB → use as-is
+ *   5. Import expired credentials from Kiro CLI DB → refresh those
+ *
+ * After any successful refresh, the new tokens are synced back to the
+ * Kiro CLI DB (fire-and-forget) for bidirectional sync.
+ */
+export async function refreshKiroToken(
+  credentials: OAuthCredentials,
+): Promise<KiroCredentials> {
+  const inputMethod = (credentials as Partial<KiroCredentials>).authMethod;
+  const authMethod: "builder-id" | "idc" | "desktop" =
+    inputMethod === "builder-id" || inputMethod === "idc" || inputMethod === "desktop"
+      ? inputMethod
+      : "idc";
+  if (
+    inputMethod !== undefined &&
+    inputMethod !== "builder-id" &&
+    inputMethod !== "idc" &&
+    inputMethod !== "desktop"
+  ) {
+    log.warn(`refreshKiroToken: unrecognized authMethod "${String(inputMethod)}" — defaulting to "idc"`);
+  }
+
+  const baseCreds: KiroCredentials = {
+    ...credentials,
+    clientId: (credentials as KiroCredentials).clientId ?? credentials.refresh.split("|")[1] ?? "",
+    clientSecret: (credentials as KiroCredentials).clientSecret ?? credentials.refresh.split("|")[2] ?? "",
+    region: (credentials as KiroCredentials).region,
+    authMethod,
+  };
+
+  const errors: string[] = [];
+
+  // ── Layer 1: Normal refresh with current credentials ──────────
+  try {
+    log.debug("refresh.cascade: layer 1 — normal refresh");
+    const result = await refreshTokenInner(baseCreds);
+    void syncBackToKiroCli(result);
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`L1(normal): ${msg}`);
+    log.warn(`refresh.cascade: layer 1 failed — ${msg}`);
+  }
+
+  // ── Layer 2: Import fresh Kiro CLI credentials → use as-is ────
+  let freshImport: KiroCliCredentials | null = null;
+  try {
+    log.debug("refresh.cascade: layer 2 — fresh kiro-cli import");
+    const { importFromKiroCli } = await import("./kiro-cli-sync");
+    freshImport = await importFromKiroCli();
+    if (freshImport?.accessToken) {
+      const result = kiroCredsFromCliImport(freshImport);
+      log.info("refresh.cascade: layer 2 succeeded — using fresh kiro-cli credentials");
+      return result;
+    }
+    errors.push("L2(fresh-import): no valid credentials found");
+    log.debug("refresh.cascade: layer 2 — no fresh credentials");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`L2(fresh-import): ${msg}`);
+    log.warn(`refresh.cascade: layer 2 failed — ${msg}`);
+  }
+
+  // ── Layer 3: Refresh the fresh Kiro CLI credentials ───────────
+  if (freshImport?.refreshToken) {
+    try {
+      log.debug("refresh.cascade: layer 3 — refresh fresh kiro-cli creds");
+      const freshCreds = kiroCredsFromCliImport(freshImport);
+      const result = await refreshTokenInner(freshCreds);
+      void syncBackToKiroCli(result);
+      log.info("refresh.cascade: layer 3 succeeded — refreshed fresh kiro-cli credentials");
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`L3(refresh-fresh): ${msg}`);
+      log.warn(`refresh.cascade: layer 3 failed — ${msg}`);
+    }
+  }
+
+  // ── Layer 4: Import expired Kiro CLI credentials → use as-is ──
+  let expiredImport: KiroCliCredentials | null = null;
+  try {
+    log.debug("refresh.cascade: layer 4 — expired kiro-cli import");
+    const { getKiroCliCredentialsAllowExpired } = await import("./kiro-cli-sync");
+    expiredImport = await getKiroCliCredentialsAllowExpired();
+    if (expiredImport?.accessToken && expiredImport !== freshImport) {
+      const result = kiroCredsFromCliImport(expiredImport);
+      log.info("refresh.cascade: layer 4 succeeded — using expired kiro-cli credentials");
+      return result;
+    }
+    errors.push("L4(expired-import): no different expired credentials");
+    log.debug("refresh.cascade: layer 4 — no additional expired credentials");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`L4(expired-import): ${msg}`);
+    log.warn(`refresh.cascade: layer 4 failed — ${msg}`);
+  }
+
+  // ── Layer 5: Refresh the expired Kiro CLI credentials ─────────
+  if (expiredImport?.refreshToken) {
+    try {
+      log.debug("refresh.cascade: layer 5 — refresh expired kiro-cli creds");
+      const expiredCreds = kiroCredsFromCliImport(expiredImport);
+      const result = await refreshTokenInner(expiredCreds);
+      void syncBackToKiroCli(result);
+      log.info("refresh.cascade: layer 5 succeeded — refreshed expired kiro-cli credentials");
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`L5(refresh-expired): ${msg}`);
+      log.warn(`refresh.cascade: layer 5 failed — ${msg}`);
+    }
+  }
+
+  // All layers exhausted.
+  throw new Error(
+    `Kiro token refresh failed — all 5 cascade layers exhausted. ` +
+    `Re-login required.\n${errors.join("\n")}`,
+  );
 }

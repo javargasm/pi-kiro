@@ -271,9 +271,10 @@ describe("refreshKiroToken", () => {
   });
   afterEach(() => {
     global.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
-  it("refreshes using pipe-packed credentials at the stored region", async () => {
+  it("layer 1 succeeds: refreshes using pipe-packed credentials at the stored region", async () => {
     fetchMock.mockResolvedValueOnce(
       okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
     );
@@ -300,24 +301,15 @@ describe("refreshKiroToken", () => {
     );
   });
 
-  it("throws when region is missing", async () => {
+  it("cascade exhausts all layers and throws when region is missing", async () => {
+    // All layers will fail — layer 1 fails on missing region, kiro-cli layers
+    // return null (no DB file in test env).
     await expect(
       refreshKiroToken({ refresh: "RT|CID|SEC|idc", access: "x", expires: 0 }),
-    ).rejects.toThrow(/missing region/);
+    ).rejects.toThrow(/cascade layers exhausted/);
   });
 
-  it("throws when refresh token is missing pieces", async () => {
-    await expect(
-      refreshKiroToken({
-        refresh: "just-a-token",
-        access: "x",
-        expires: 0,
-        region: "us-east-1",
-      }),
-    ).rejects.toThrow(/missing clientId/);
-  });
-
-  it("throws on HTTP failure", async () => {
+  it("cascade exhausts all layers and throws on HTTP failure with no CLI fallback", async () => {
     fetchMock.mockResolvedValueOnce(fail(401));
     await expect(
       refreshKiroToken({
@@ -326,6 +318,58 @@ describe("refreshKiroToken", () => {
         expires: 0,
         region: "us-east-1",
       }),
-    ).rejects.toThrow(/Token refresh failed/);
+    ).rejects.toThrow(/cascade layers exhausted/);
+  });
+
+  it("error message includes all layer failure reasons", async () => {
+    fetchMock.mockResolvedValueOnce(fail(500));
+    try {
+      await refreshKiroToken({
+        refresh: "RT|CID|SEC|idc",
+        access: "x",
+        expires: 0,
+        region: "us-east-1",
+      });
+      // Should not reach here
+      expect.unreachable("Expected refreshKiroToken to throw");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("L1(normal)");
+      expect(msg).toContain("cascade layers exhausted");
+    }
+  });
+
+  it("preserves authMethod through the cascade", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
+    );
+    const refreshed = await refreshKiroToken({
+      refresh: "RT|CID|SEC|builder-id",
+      access: "old",
+      expires: 0,
+      region: "us-east-1",
+      authMethod: "builder-id",
+    } as any);
+    expect(refreshed.authMethod).toBe("builder-id");
+  });
+
+  it("desktop authMethod uses the desktop endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
+    );
+    const refreshed = await refreshKiroToken({
+      refresh: "RT|||desktop",
+      access: "old",
+      expires: 0,
+      region: "us-east-1",
+      authMethod: "desktop",
+    } as any);
+    expect(refreshed.authMethod).toBe("desktop");
+    expect(refreshed.access).toBe("AT2");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 });
+
