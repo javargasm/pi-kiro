@@ -6,7 +6,6 @@
 // the padding used to cause echo-loop bugs downstream.
 
 import type {
-  AssistantMessage,
   ImageContent,
   Message,
   TextContent,
@@ -15,6 +14,7 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { createHash } from "node:crypto";
 import { TOOL_PURPOSE_FIELD } from "./kiro-defaults.ts";
 
 /** Drop assistant messages that ended in error/aborted — partial turns
@@ -134,6 +134,20 @@ export function parseToolArgs(input: unknown): Record<string, unknown> {
   }
 }
 
+const KIRO_TOOL_USE_ID_RE = /^tooluse_[A-Za-z0-9]+$/;
+
+/**
+ * Kiro accepts its own compact `tooluse_*` IDs in replayed history. Other
+ * providers / harness layers can produce IDs such as `call_...|fc_...`, which
+ * Kiro rejects as `Invalid tool use format`. Canonicalize only the wire-format
+ * ID while preserving deterministic toolUse/toolResult matching.
+ */
+export function toKiroToolUseId(id: string): string {
+  if (KIRO_TOOL_USE_ID_RE.test(id)) return id;
+  const digest = createHash("sha256").update(id).digest("hex").slice(0, 22);
+  return `tooluse_${digest}`;
+}
+
 export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
   return tools.map((tool) => {
     const schema = tool.parameters as Record<string, unknown>;
@@ -201,7 +215,7 @@ export function convertImagesToKiro(
  */
 export function buildHistory(
   messages: Message[],
-  modelId: string,
+  _modelId: string,
   systemPrompt?: string,
 ): { history: KiroHistoryEntry[]; systemPrepended: boolean; currentMsgStartIdx: number } {
   const history: KiroHistoryEntry[] = [];
@@ -264,7 +278,7 @@ export function buildHistory(
             const tc = block as ToolCall;
             armToolUses.push({
               name: tc.name,
-              toolUseId: tc.id,
+              toolUseId: toKiroToolUseId(tc.id),
               input: parseToolArgs(tc.arguments),
             });
           }
@@ -286,7 +300,7 @@ export function buildHistory(
       {
         content: [{ text: truncate(getContentText(msg), TOOL_RESULT_LIMIT) }],
         status: trMsg.isError ? "error" : "success",
-        toolUseId: trMsg.toolCallId,
+        toolUseId: toKiroToolUseId(trMsg.toolCallId),
       },
     ];
     const trImages: ImageContent[] = [];
@@ -300,7 +314,7 @@ export function buildHistory(
       toolResults.push({
         content: [{ text: truncate(getContentText(next), TOOL_RESULT_LIMIT) }],
         status: next.isError ? "error" : "success",
-        toolUseId: next.toolCallId,
+        toolUseId: toKiroToolUseId(next.toolCallId),
       });
       if (Array.isArray(next.content)) {
         for (const c of next.content) if (c.type === "image") trImages.push(c as ImageContent);

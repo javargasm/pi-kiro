@@ -8,7 +8,6 @@ import type {
   AssistantMessageEventStream,
   Context,
   ImageContent,
-  Message,
   Model,
   SimpleStreamOptions,
   TextContent,
@@ -28,7 +27,6 @@ import { countTokens } from "./tokenizer";
 import {
   buildHistory,
   convertImagesToKiro,
-  convertToolsToKiro,
   extractImages,
   getContentText,
   type KiroEnvState,
@@ -39,6 +37,7 @@ import {
   type KiroUserInputMessage,
   normalizeMessages,
   parseToolArgs,
+  toKiroToolUseId,
   TOOL_RESULT_LIMIT,
   truncate,
 } from "./transform";
@@ -255,6 +254,199 @@ interface KiroToolCallState {
   input: string;
 }
 
+interface KiroToolUseSummary {
+  name: string;
+  toolUseId: string;
+  inputType: string;
+  inputKeys: string[];
+}
+
+interface KiroToolResultSummary {
+  toolUseId: string;
+  status: "success" | "error";
+  contentCount: number;
+  textChars: number;
+}
+
+interface KiroHistoryEntrySummary {
+  index: number;
+  role: "user" | "assistant" | "unknown";
+  contentChars: number;
+  imageCount?: number;
+  toolUses?: KiroToolUseSummary[];
+  toolResults?: KiroToolResultSummary[];
+}
+
+interface KiroToolSpecSummary {
+  name: string;
+  descriptionChars: number;
+  schemaKeys: string[];
+  propertyNames: string[];
+  requiredCount: number;
+}
+
+interface KiroRequestShapeSummary {
+  conversationId: string;
+  modelId?: string;
+  requestJsonChars: number;
+  historyLen: number;
+  roleSequence: string[];
+  history: KiroHistoryEntrySummary[];
+  current: {
+    contentChars: number;
+    imageCount: number;
+    toolResultCount: number;
+    toolSpecCount: number;
+    toolSpecNames: string[];
+    toolResults: KiroToolResultSummary[];
+    toolSpecs: KiroToolSpecSummary[];
+  };
+  toolIntegrity: {
+    toolUseIds: string[];
+    toolResultIds: string[];
+    duplicateToolUseIds: string[];
+    duplicateToolResultIds: string[];
+    unmatchedToolResults: string[];
+    toolUsesWithoutResults: string[];
+  };
+  additionalModelRequestFieldKeys: string[];
+  hasProfileArn: boolean;
+  agentMode?: string;
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+function duplicateValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) dupes.add(value);
+    else seen.add(value);
+  }
+  return [...dupes].sort();
+}
+
+function objectKeys(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>).sort();
+}
+
+function summarizeToolUse(toolUse: { name: string; toolUseId: string; input: Record<string, unknown> }): KiroToolUseSummary {
+  const input = toolUse.input;
+  return {
+    name: toolUse.name,
+    toolUseId: toolUse.toolUseId,
+    inputType: Array.isArray(input) ? "array" : typeof input,
+    inputKeys: objectKeys(input),
+  };
+}
+
+function summarizeToolResult(toolResult: KiroToolResult): KiroToolResultSummary {
+  return {
+    toolUseId: toolResult.toolUseId,
+    status: toolResult.status,
+    contentCount: toolResult.content.length,
+    textChars: toolResult.content.reduce((sum, part) => sum + part.text.length, 0),
+  };
+}
+
+function summarizeToolSpec(toolSpec: KiroToolSpec): KiroToolSpecSummary {
+  const spec = toolSpec.toolSpecification;
+  const schema = spec.inputSchema.json;
+  const properties = schema.properties as Record<string, unknown> | undefined;
+  const required = schema.required;
+  return {
+    name: spec.name,
+    descriptionChars: spec.description.length,
+    schemaKeys: objectKeys(schema),
+    propertyNames: properties && typeof properties === "object" && !Array.isArray(properties)
+      ? Object.keys(properties).sort()
+      : [],
+    requiredCount: Array.isArray(required) ? required.length : 0,
+  };
+}
+
+function summarizeHistoryEntry(entry: KiroHistoryEntry, index: number): KiroHistoryEntrySummary {
+  if (entry.userInputMessage) {
+    const toolResults = entry.userInputMessage.userInputMessageContext?.toolResults ?? [];
+    return {
+      index,
+      role: "user",
+      contentChars: entry.userInputMessage.content.length,
+      imageCount: entry.userInputMessage.images?.length ?? 0,
+      ...(toolResults.length > 0 ? { toolResults: toolResults.map(summarizeToolResult) } : {}),
+    };
+  }
+  if (entry.assistantResponseMessage) {
+    const toolUses = entry.assistantResponseMessage.toolUses ?? [];
+    return {
+      index,
+      role: "assistant",
+      contentChars: entry.assistantResponseMessage.content.length,
+      ...(toolUses.length > 0 ? { toolUses: toolUses.map(summarizeToolUse) } : {}),
+    };
+  }
+  return { index, role: "unknown", contentChars: 0 };
+}
+
+function collectToolIntegrity(history: KiroHistoryEntry[], currentToolResults: KiroToolResult[]) {
+  const toolUseIds: string[] = [];
+  const toolResultIds: string[] = currentToolResults.map((toolResult) => toolResult.toolUseId);
+
+  for (const entry of history) {
+    for (const toolUse of entry.assistantResponseMessage?.toolUses ?? []) {
+      toolUseIds.push(toolUse.toolUseId);
+    }
+    for (const toolResult of entry.userInputMessage?.userInputMessageContext?.toolResults ?? []) {
+      toolResultIds.push(toolResult.toolUseId);
+    }
+  }
+
+  const useSet = new Set(toolUseIds);
+  const resultSet = new Set(toolResultIds);
+  return {
+    toolUseIds: uniqueSorted(toolUseIds),
+    toolResultIds: uniqueSorted(toolResultIds),
+    duplicateToolUseIds: duplicateValues(toolUseIds),
+    duplicateToolResultIds: duplicateValues(toolResultIds),
+    unmatchedToolResults: uniqueSorted(toolResultIds.filter((id) => !useSet.has(id))),
+    toolUsesWithoutResults: uniqueSorted(toolUseIds.filter((id) => !resultSet.has(id))),
+  };
+}
+
+function summarizeKiroRequest(request: KiroRequest, requestBody: string): KiroRequestShapeSummary {
+  const current = request.conversationState.currentMessage.userInputMessage;
+  const history = request.conversationState.history ?? [];
+  const currentContext = current.userInputMessageContext;
+  const currentToolResults = currentContext?.toolResults ?? [];
+  const currentTools = currentContext?.tools ?? [];
+  const historySummary = history.map(summarizeHistoryEntry);
+
+  return {
+    conversationId: request.conversationState.conversationId,
+    modelId: current.modelId,
+    requestJsonChars: requestBody.length,
+    historyLen: history.length,
+    roleSequence: historySummary.map((entry) => entry.role),
+    history: historySummary,
+    current: {
+      contentChars: current.content.length,
+      imageCount: current.images?.length ?? 0,
+      toolResultCount: currentToolResults.length,
+      toolSpecCount: currentTools.length,
+      toolSpecNames: currentTools.map((toolSpec) => toolSpec.toolSpecification.name).sort(),
+      toolResults: currentToolResults.map(summarizeToolResult),
+      toolSpecs: currentTools.map(summarizeToolSpec),
+    },
+    toolIntegrity: collectToolIntegrity(history, currentToolResults),
+    additionalModelRequestFieldKeys: objectKeys(request.additionalModelRequestFields),
+    hasProfileArn: !!request.profileArn,
+    agentMode: request.agentMode,
+  };
+}
+
 function emitToolCall(
   state: KiroToolCallState,
   output: AssistantMessage,
@@ -413,7 +605,7 @@ export function streamKiro(
                 const tc = b as ToolCall;
                 armToolUses.push({
                   name: tc.name,
-                  toolUseId: tc.id,
+                  toolUseId: toKiroToolUseId(tc.id),
                   input: parseToolArgs(tc.arguments),
                 });
               }
@@ -447,7 +639,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toKiroToolUseId(trm.toolCallId),
               });
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
@@ -470,7 +662,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toKiroToolUseId(trm.toolCallId),
               });
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
@@ -647,6 +839,9 @@ export function streamKiro(
         while (true) {
           const mid = crypto.randomUUID().replace(/-/g, "");
           const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${mid}`;
+          const requestBody = JSON.stringify(request);
+          const requestShape = log.isDebug() ? summarizeKiroRequest(request, requestBody) : undefined;
+          if (requestShape) log.debug("request.shape", requestShape);
 
           log.debug("request.send", {
             attempt: retryCount,
@@ -655,6 +850,7 @@ export function streamKiro(
             currentContentLen: currentContent.length,
             hasImages: !!currentImages,
             toolResultCount: currentToolResults.length,
+            requestJsonChars: requestBody.length,
           });
 
           response = await fetch(endpoint, {
@@ -671,7 +867,7 @@ export function streamKiro(
               "x-amz-user-agent": ua,
               "user-agent": ua,
             },
-            body: JSON.stringify(request),
+            body: requestBody,
             signal: options?.signal,
           });
 
@@ -683,7 +879,11 @@ export function streamKiro(
           } catch {
             errText = "";
           }
-          log.debug("response.error", { status: response.status, body: errText });
+          log.debug("response.error", {
+            status: response.status,
+            body: errText,
+            ...(requestShape ? { requestShape } : {}),
+          });
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {
             capacityRetryCount++;

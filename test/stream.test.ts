@@ -4,6 +4,9 @@ import type {
   AssistantMessageEvent,
   Context,
   Model,
+  Tool,
+  ToolResultMessage,
+  UserMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HIDDEN_REASONING_COUNTDOWN_MS, resetProfileArnCache, streamKiro } from "../src/stream";
@@ -29,6 +32,52 @@ function makeContext(userMsg = "Hello"): Context {
     systemPrompt: "You are helpful",
     messages: [{ role: "user", content: userMsg, timestamp: Date.now() }],
     tools: [],
+  };
+}
+
+const ts = Date.now();
+const zeroUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function user(content: string): UserMessage {
+  return { role: "user", content, timestamp: ts };
+}
+
+function assistantWithToolCall(): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [
+      { type: "text", text: "SECRET_ASSISTANT_TEXT" },
+      {
+        type: "toolCall",
+        id: "tc1",
+        name: "bash",
+        arguments: { cmd: "ls", secret: "SECRET_ARG" },
+      },
+    ],
+    api: "kiro-api",
+    provider: "kiro",
+    model: "test",
+    usage: zeroUsage,
+    stopReason: "toolUse",
+    timestamp: ts,
+  };
+}
+
+function toolResult(id: string, text: string): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: id,
+    toolName: "bash",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp: ts,
   };
 }
 
@@ -105,6 +154,114 @@ describe("streamKiro", () => {
     );
     expect(opts.headers["x-amzn-kiro-agent-mode"]).toBe("vibe");
     expect(opts.headers["Content-Type"]).toBe("application/x-amz-json-1.0");
+  });
+
+  it("logs safe request.shape diagnostics for tool-use format errors", async () => {
+    const originalLevel = process.env.KIRO_LOG;
+    process.env.KIRO_LOG = "debug";
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        text: () => Promise.resolve('{"message":"Invalid tool use format."}'),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const tool: Tool = {
+        name: "bash",
+        description: "Run shell commands",
+        parameters: {
+          type: "object",
+          properties: { cmd: { type: "string" } },
+          required: ["cmd"],
+          additionalProperties: false,
+        },
+      };
+      const context: Context = {
+        systemPrompt: "SECRET_SYSTEM_PROMPT",
+        messages: [
+          user("SECRET_USER_PROMPT"),
+          assistantWithToolCall(),
+          toolResult("tc1", "SECRET_TOOL_RESULT"),
+          user("please continue"),
+        ],
+        tools: [tool],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const shapeCall = logSpy.mock.calls.find((call) => String(call[0]).includes("request.shape"));
+      expect(shapeCall).toBeDefined();
+      const shape = shapeCall?.[1] as Record<string, unknown>;
+      expect(shape).toMatchObject({
+        historyLen: expect.any(Number),
+        current: {
+          toolSpecNames: ["bash"],
+        },
+      });
+      const shapeJson = JSON.stringify(shape);
+      expect(shapeJson).toContain("tooluse_");
+      expect(shapeJson).not.toContain("SECRET_USER_PROMPT");
+      expect(shapeJson).not.toContain("SECRET_TOOL_RESULT");
+      expect(shapeJson).not.toContain("SECRET_SYSTEM_PROMPT");
+      expect(shapeJson).not.toContain("SECRET_ARG");
+
+      const errorCall = logSpy.mock.calls.find((call) => String(call[0]).includes("response.error"));
+      expect(errorCall?.[1]).toMatchObject({
+        status: 400,
+        requestShape: shape,
+      });
+    } finally {
+      logSpy.mockRestore();
+      if (originalLevel === undefined) delete process.env.KIRO_LOG;
+      else process.env.KIRO_LOG = originalLevel;
+    }
+  });
+
+  it("canonicalizes current-turn tool IDs before sending to Kiro", async () => {
+    const rawId = "call_currentTool|fc_currentFrame";
+    const fetchMock = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", fetchMock);
+
+    const assistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: rawId, name: "bash", arguments: { cmd: "pwd" } }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "test",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const result: ToolResultMessage = {
+      role: "toolResult",
+      toolCallId: rawId,
+      toolName: "bash",
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [user("run pwd"), assistant, result],
+      tools: [],
+    };
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    const history = body.conversationState.history as Array<{
+      assistantResponseMessage?: { toolUses?: Array<{ toolUseId: string }> };
+    }>;
+    const assistantToolUse = history.find((entry) => entry.assistantResponseMessage?.toolUses)
+      ?.assistantResponseMessage?.toolUses?.[0];
+    const currentToolResult = body.conversationState.currentMessage.userInputMessage
+      .userInputMessageContext.toolResults[0];
+
+    expect(assistantToolUse?.toolUseId).toMatch(/^tooluse_[a-f0-9]{22}$/);
+    expect(assistantToolUse?.toolUseId).toBe(currentToolResult.toolUseId);
+    expect(JSON.stringify(body)).not.toContain(rawId);
   });
 
   it("parses text + contextUsage into usage", async () => {

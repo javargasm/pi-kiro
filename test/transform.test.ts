@@ -18,6 +18,7 @@ import {
   MAX_KIRO_IMAGES,
   normalizeMessages,
   TOOL_RESULT_LIMIT,
+  toKiroToolUseId,
   truncate,
 } from "../src/transform";
 
@@ -137,8 +138,8 @@ describe("convertImagesToKiro", () => {
   });
 
   it("omits images exceeding MAX_KIRO_IMAGE_BYTES", () => {
-    // base64 encodes 3 bytes per 4 chars, so 5_000_001 chars ≈ 3.75M bytes
-    const oversized = "A".repeat(5_000_001);
+    // base64 encodes 3 bytes per 4 chars.
+    const oversized = "A".repeat(Math.ceil(((MAX_KIRO_IMAGE_BYTES + 1) * 4) / 3));
     const small = "QQ=="; // 1 byte
     const { images, omitted } = convertImagesToKiro([
       { mimeType: "image/png", data: oversized },
@@ -240,6 +241,36 @@ describe("collapseAgenticLoops", () => {
 });
 
 describe("buildHistory", () => {
+  describe("toolUseId canonicalization", () => {
+    it("keeps native Kiro tooluse IDs unchanged", () => {
+      expect(toKiroToolUseId("tooluse_abcABC123")).toBe("tooluse_abcABC123");
+    });
+
+    it("maps non-Kiro tool IDs to deterministic Kiro-compatible IDs", () => {
+      const canonical = toKiroToolUseId("call_abc|fc_def");
+      expect(canonical).toMatch(/^tooluse_[a-f0-9]{22}$/);
+      expect(canonical).toBe(toKiroToolUseId("call_abc|fc_def"));
+      expect(canonical).not.toContain("|");
+    });
+
+    it("canonicalizes assistant toolUses and matching toolResults together", () => {
+      const rawId = "call_abc123|fc_def456";
+      const a = assistant("");
+      a.content = [{ type: "toolCall", id: rawId, name: "bash", arguments: { cmd: "ls" } }];
+      const msgs: Message[] = [user("go"), a, toolResult(rawId, "ok"), user("next")];
+
+      const { history } = buildHistory(msgs, "M");
+      const assistantEntry = history.find((h) => h.assistantResponseMessage?.toolUses);
+      const resultEntry = history.find((h) => h.userInputMessage?.userInputMessageContext?.toolResults);
+      const toolUseId = assistantEntry?.assistantResponseMessage?.toolUses?.[0]?.toolUseId;
+      const toolResultId = resultEntry?.userInputMessage?.userInputMessageContext?.toolResults?.[0]?.toolUseId;
+
+      expect(toolUseId).toMatch(/^tooluse_[a-f0-9]{22}$/);
+      expect(toolUseId).toBe(toolResultId);
+      expect(toolUseId).not.toContain("|");
+    });
+  });
+
   it("returns empty history for single user", () => {
     const { history } = buildHistory([user("Hello")], "M");
     expect(history).toHaveLength(0);
