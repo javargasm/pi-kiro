@@ -514,6 +514,26 @@ describe("streamKiro", () => {
       }
     });
 
+    it("strips __tool_use_purpose from tool call arguments", async () => {
+      const toolPayload =
+        '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\",\\"__tool_use_purpose\\":\\"test\\"}","stop":true}';
+      vi.stubGlobal(
+        "fetch",
+        mockFetchOk(`${toolPayload}{"contextUsagePercentage":5}`),
+      );
+      const events = await collect(streamKiro(hiddenModel(), makeContext(), { apiKey: "tok" }));
+
+      const done = events.find((e) => e.type === "done");
+      expect(done?.type === "done").toBe(true);
+      if (done?.type === "done") {
+        const tc = done.message.content[0];
+        expect(tc?.type).toBe("toolCall");
+        if (tc?.type === "toolCall") {
+          expect(tc.arguments).toEqual({ cmd: "ls" });
+        }
+      }
+    });
+
     it("slow response emits complete shim after countdown", async () => {
       // When nothing arrives within HIDDEN_REASONING_COUNTDOWN_MS,
       // the timer fires a complete shim (start + delta + end) in one

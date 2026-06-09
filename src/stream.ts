@@ -457,6 +457,9 @@ function emitToolCall(
   let args: Record<string, unknown>;
   try {
     args = JSON.parse(state.input) as Record<string, unknown>;
+    if (args && typeof args === "object" && "__tool_use_purpose" in args) {
+      delete args.__tool_use_purpose;
+    }
   } catch (e) {
     log.warn(
       `failed to parse tool input for "${state.name}" (${state.toolUseId}): ${e instanceof Error ? e.message : String(e)}`,
