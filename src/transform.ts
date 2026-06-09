@@ -6,7 +6,6 @@
 // the padding used to cause echo-loop bugs downstream.
 
 import type {
-  AssistantMessage,
   ImageContent,
   Message,
   TextContent,
@@ -14,7 +13,9 @@ import type {
   Tool,
   ToolCall,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
+import { createHash } from "node:crypto";
+import { TOOL_PURPOSE_FIELD } from "./kiro-defaults.ts";
 
 /** Drop assistant messages that ended in error/aborted — partial turns
  *  shouldn't be replayed. */
@@ -53,12 +54,21 @@ export interface KiroToolSpec {
   };
 }
 
+export interface KiroEnvState {
+  operatingSystem: string;
+  currentWorkingDirectory: string;
+}
+
 export interface KiroUserInputMessage {
   content: string;
-  modelId: string;
+  modelId?: string;
   origin: "KIRO_CLI";
   images?: KiroImage[];
-  userInputMessageContext?: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] };
+  userInputMessageContext?: {
+    envState?: KiroEnvState;
+    toolResults?: KiroToolResult[];
+    tools?: KiroToolSpec[];
+  };
 }
 
 export interface KiroAssistantResponseMessage {
@@ -74,6 +84,12 @@ export interface KiroHistoryEntry {
 // ---- Utilities ---------------------------------------------------------
 
 export const TOOL_RESULT_LIMIT = 250_000;
+
+/** Maximum images per message accepted by the Kiro API. */
+export const MAX_KIRO_IMAGES = 4;
+
+/** Maximum decoded size per image (bytes) accepted by the Kiro API. */
+export const MAX_KIRO_IMAGE_BYTES = 3_750_000;
 
 /** Middle-ellipsis truncation: preserve start and end. */
 export function truncate(text: string, limit: number): string {
@@ -118,23 +134,73 @@ export function parseToolArgs(input: unknown): Record<string, unknown> {
   }
 }
 
-export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
-  return tools.map((tool) => ({
-    toolSpecification: {
-      name: tool.name,
-      description: tool.description,
-      inputSchema: { json: tool.parameters as Record<string, unknown> },
-    },
-  }));
+const KIRO_TOOL_USE_ID_RE = /^tooluse_[A-Za-z0-9]+$/;
+
+/**
+ * Kiro accepts its own compact `tooluse_*` IDs in replayed history. Other
+ * providers / harness layers can produce IDs such as `call_...|fc_...`, which
+ * Kiro rejects as `Invalid tool use format`. Canonicalize only the wire-format
+ * ID while preserving deterministic toolUse/toolResult matching.
+ */
+export function toKiroToolUseId(id: string): string {
+  if (KIRO_TOOL_USE_ID_RE.test(id)) return id;
+  const digest = createHash("sha256").update(id).digest("hex").slice(0, 22);
+  return `tooluse_${digest}`;
 }
 
+export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
+  return tools.map((tool) => {
+    const schema = tool.parameters as Record<string, unknown>;
+    const props = (schema.properties ?? {}) as Record<string, unknown>;
+    return {
+      toolSpecification: {
+        name: tool.name,
+        description: tool.description,
+        inputSchema: {
+          json: {
+            ...schema,
+            properties: {
+              ...props,
+              __tool_use_purpose: TOOL_PURPOSE_FIELD,
+            },
+          },
+        },
+      },
+    };
+  });
+}
+
+/**
+ * Convert images to Kiro wire format, enforcing API limits:
+ * - Max {@link MAX_KIRO_IMAGES} images per call
+ * - Max {@link MAX_KIRO_IMAGE_BYTES} decoded bytes per image
+ *
+ * Oversized/excess images are silently dropped and counted in `omitted`.
+ */
 export function convertImagesToKiro(
   images: Array<{ mimeType: string; data: string }>,
-): KiroImage[] {
-  return images.map((img) => ({
-    format: img.mimeType.split("/")[1] || "png",
-    source: { bytes: img.data },
-  }));
+): { images: KiroImage[]; omitted: number } {
+  let omitted = 0;
+  const valid: KiroImage[] = [];
+
+  for (const img of images) {
+    // base64 encodes 3 bytes per 4 chars
+    const estimatedBytes = Math.ceil(img.data.length * 3 / 4);
+    if (estimatedBytes > MAX_KIRO_IMAGE_BYTES) {
+      omitted++;
+      continue;
+    }
+    if (valid.length >= MAX_KIRO_IMAGES) {
+      omitted++;
+      continue;
+    }
+    valid.push({
+      format: img.mimeType.split("/")[1] || "png",
+      source: { bytes: img.data },
+    });
+  }
+
+  return { images: valid, omitted };
 }
 
 // ---- History builder ---------------------------------------------------
@@ -149,7 +215,7 @@ export function convertImagesToKiro(
  */
 export function buildHistory(
   messages: Message[],
-  modelId: string,
+  _modelId: string,
   systemPrompt?: string,
 ): { history: KiroHistoryEntry[]; systemPrepended: boolean; currentMsgStartIdx: number } {
   const history: KiroHistoryEntry[] = [];
@@ -182,9 +248,8 @@ export function buildHistory(
       const images = extractImages(msg);
       const uim: KiroUserInputMessage = {
         content,
-        modelId,
         origin: "KIRO_CLI",
-        ...(images.length > 0 ? { images: convertImagesToKiro(images) } : {}),
+        ...(images.length > 0 ? { images: convertImagesToKiro(images).images } : {}),
       };
 
       const prev = history[history.length - 1];
@@ -213,7 +278,7 @@ export function buildHistory(
             const tc = block as ToolCall;
             armToolUses.push({
               name: tc.name,
-              toolUseId: tc.id,
+              toolUseId: toKiroToolUseId(tc.id),
               input: parseToolArgs(tc.arguments),
             });
           }
@@ -235,7 +300,7 @@ export function buildHistory(
       {
         content: [{ text: truncate(getContentText(msg), TOOL_RESULT_LIMIT) }],
         status: trMsg.isError ? "error" : "success",
-        toolUseId: trMsg.toolCallId,
+        toolUseId: toKiroToolUseId(trMsg.toolCallId),
       },
     ];
     const trImages: ImageContent[] = [];
@@ -249,7 +314,7 @@ export function buildHistory(
       toolResults.push({
         content: [{ text: truncate(getContentText(next), TOOL_RESULT_LIMIT) }],
         status: next.isError ? "error" : "success",
-        toolUseId: next.toolCallId,
+        toolUseId: toKiroToolUseId(next.toolCallId),
       });
       if (Array.isArray(next.content)) {
         for (const c of next.content) if (c.type === "image") trImages.push(c as ImageContent);
@@ -265,7 +330,7 @@ export function buildHistory(
       if (trImages.length > 0) {
         prev.userInputMessage.images = [
           ...(prev.userInputMessage.images ?? []),
-          ...convertImagesToKiro(trImages),
+          ...convertImagesToKiro(trImages).images,
         ];
       }
       if (!prev.userInputMessage.userInputMessageContext) {
@@ -279,14 +344,82 @@ export function buildHistory(
       history.push({
         userInputMessage: {
           content: "Tool results provided.",
-          modelId,
           origin: "KIRO_CLI",
-          ...(trImages.length > 0 ? { images: convertImagesToKiro(trImages) } : {}),
+          ...(trImages.length > 0 ? { images: convertImagesToKiro(trImages).images } : {}),
           userInputMessageContext: { toolResults },
         },
       });
     }
   }
 
-  return { history, systemPrepended, currentMsgStartIdx };
+  return { history: collapseAgenticLoops(history), systemPrepended, currentMsgStartIdx };
+}
+
+// ---- Agentic loop collapse --------------------------------------------
+
+/**
+ * Collapse consecutive tool-use loops in history. When the agent calls
+ * tools N times in sequence (ASST(toolUses) → USER(toolResults) pairs),
+ * keep text only on the first assistant message and replace subsequent
+ * ones with a short placeholder. This prevents the model from re-deriving
+ * its preamble on every iteration, saving context tokens.
+ */
+export function collapseAgenticLoops(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
+  if (history.length < 4) return history;
+
+  const result: KiroHistoryEntry[] = [];
+  let i = 0;
+
+  while (i < history.length) {
+    const entry = history[i];
+
+    // Detect start of agentic sequence:
+    // ASST with toolUses followed by USER with toolResults
+    if (
+      entry?.assistantResponseMessage?.toolUses &&
+      i + 1 < history.length &&
+      history[i + 1]?.userInputMessage?.userInputMessageContext?.toolResults
+    ) {
+      // Walk forward to find the end of the contiguous sequence
+      let j = i;
+      while (j < history.length) {
+        const asst = history[j];
+        if (!asst?.assistantResponseMessage?.toolUses) break;
+        const nextUser = j + 1 < history.length ? history[j + 1] : null;
+        if (!nextUser?.userInputMessage?.userInputMessageContext?.toolResults) break;
+        j += 2;
+      }
+
+      const pairCount = (j - i) / 2;
+
+      if (pairCount > 1) {
+        // Multi-iteration loop: keep full text on first pair only
+        for (let k = i; k < j; k += 2) {
+          const asst = history[k]!;
+          const user = history[k + 1]!;
+
+          if (k === i) {
+            result.push(asst);
+          } else {
+            result.push({
+              assistantResponseMessage: {
+                content: "[tool calling continues]",
+                toolUses: asst.assistantResponseMessage!.toolUses,
+              },
+            });
+          }
+          result.push(user);
+        }
+      } else {
+        // Single pair — keep as-is
+        result.push(history[i]!, history[i + 1]!);
+      }
+      i = j;
+    } else {
+      result.push(entry!);
+      i++;
+    }
+  }
+
+  return result;
 }

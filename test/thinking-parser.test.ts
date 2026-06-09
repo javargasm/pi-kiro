@@ -3,8 +3,8 @@ import type {
   AssistantMessageEvent,
   AssistantMessageEventStream,
   ThinkingContent,
-} from "@mariozechner/pi-ai";
-import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { ThinkingTagParser } from "../src/thinking-parser";
 

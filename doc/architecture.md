@@ -21,22 +21,56 @@ Everything else — history sizing, compaction, retry-on-overload, message
 sanitization for cross-provider handoff — is pi-mono's responsibility and
 is handled upstream before pi-kiro ever sees the context.
 
+## Client-fidelity modules
+
+Beyond the three core jobs, a few modules exist to make pi-kiro's traffic
+indistinguishable from the real Kiro CLI and to smooth the login UX:
+
+- **`kiro-defaults.ts`** — captured Kiro CLI identity constants: the
+  synthetic system seed pair every conversation opens with, the
+  `__tool_use_purpose` field appended to every tool schema, the
+  `process.platform → operatingSystem` map, and the context-usage percent
+  (`COMPACTION_THRESHOLD_PCT`) at which we inflate `usage.input` to force
+  pi's overflow detection before a 413.
+- **`kiro-tools.ts`** — static native Kiro CLI tool schemas extracted from
+  real request captures, injected verbatim so the request is structurally
+  identical to the official client. MCP tools (codegraph, pencil) are
+  intentionally omitted because pi handles those directly.
+- **`kiro-cli-sync.ts`** — optional zero-friction login. If Kiro IDE is
+  installed and logged in, this reads its local SQLite credential DB
+  (readonly) and adapts the tokens into `KiroCredentials`, and can write
+  refreshed tokens back for bidirectional sync.
+- **`health.ts`** — classifies error strings as permanent (expired/revoked
+  grants → surface a re-login error) vs transient (let the retry loop run).
+
 ## File map
 
 ```
 pi-kiro/
 ├── src/
-│   ├── extension.ts        Entry point. Registers provider with pi.
+│   ├── extension.ts        Entry point. Registers provider with pi. Reads
+│   │                       auth.json, fetches the dynamic model catalog,
+│   │                       self-heals a missing `type:"oauth"` marker.
 │   ├── core.ts             Standalone re-exports for non-pi consumers.
-│   ├── oauth.ts            (1) Auth. Device-code login + token refresh.
-│   ├── models.ts           Model catalog + SSO-region → API-region map.
-│   ├── transform.ts        (2) pi Message[] → Kiro request body.
+│   ├── oauth.ts            (1) Auth. Device-code login + token refresh
+│   │                       (Builder ID + IAM Identity Center).
+│   ├── kiro-cli-sync.ts    (1) Optional zero-friction login: imports
+│   │                       credentials from Kiro IDE's local SQLite DB.
+│   ├── models.ts           Model catalog, SSO→API region map, dynamic
+│   │                       model fetch + cache, runtime-url resolver.
+│   ├── kiro-defaults.ts    Kiro CLI identity constants (system seed,
+│   │                       tool-purpose field, OS map, compaction pct).
+│   ├── kiro-tools.ts       Static native Kiro CLI tool schemas, injected
+│   │                       verbatim so requests match the real client.
+│   ├── transform.ts        (2) pi Message[] → Kiro request body + history
+│   │                       maintenance (merge, truncate, sanitize).
 │   ├── stream.ts           (2)+(3) HTTP orchestrator. Builds request,
 │   │                       consumes stream, handles Kiro-specific errors.
 │   ├── event-parser.ts     (3) Kiro JSON frame extractor.
 │   ├── thinking-parser.ts  (3) Splits inline <thinking> tags into
 │   │                       structured ThinkingContent blocks.
 │   ├── tokenizer.ts        ~4-chars/token heuristic when usage event absent.
+│   ├── health.ts           Permanent-vs-retryable error classification.
 │   └── debug.ts            Leveled logger gated by KIRO_LOG.
 └── test/
     ├── <per-module>.test.ts
@@ -153,21 +187,31 @@ Configured by `KIRO_LOG=debug|info|warn|error`. Default is `warn`.
 
 ```
 src/extension.ts
-    └── imports: models, oauth, stream
+    └── imports: models, oauth, stream, debug
 
 src/stream.ts (largest module)
     ├── imports: models, transform, event-parser, thinking-parser,
-    │            tokenizer, debug, pi-ai types + helpers
+    │            tokenizer, kiro-defaults, kiro-tools, debug,
+    │            pi-ai types + helpers
     └── no imports from: oauth (decoupled — token arrives via options.apiKey)
 
 src/oauth.ts
-    └── imports: debug only — pure AWS SSO-OIDC otherwise
+    └── imports: debug, health — pure AWS SSO-OIDC otherwise
+
+src/kiro-cli-sync.ts
+    └── imports: debug — readonly SQLite access otherwise
 
 src/transform.ts
-    └── imports: pi-ai types only
+    └── imports: kiro-defaults, pi-ai types
+
+src/kiro-tools.ts
+    └── imports: transform (KiroToolSpec type) only — static schema data
 
 src/thinking-parser.ts + src/event-parser.ts
     └── imports: pi-ai types only (self-contained parsers)
+
+src/health.ts + src/tokenizer.ts
+    └── no internal imports (leaf utilities)
 ```
 
 Low coupling. `stream.ts` is the only module that imports broadly; that's

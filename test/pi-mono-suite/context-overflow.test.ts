@@ -2,7 +2,7 @@
 // as context_length_exceeded so pi-mono's isContextOverflow() matches.
 // SKIP unless KIRO_LIVE_TEST=1.
 
-import { isContextOverflow } from "@mariozechner/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { complete, LIVE, suiteModel, suiteOptions } from "./_harness";
 

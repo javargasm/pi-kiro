@@ -1,4 +1,4 @@
-import type { OAuthAuthInfo, OAuthLoginCallbacks, OAuthPrompt } from "@mariozechner/pi-ai";
+import type { OAuthAuthInfo, OAuthLoginCallbacks, OAuthPrompt, OAuthSelectPrompt } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loginKiro, refreshKiroToken } from "../src/oauth";
 
@@ -8,18 +8,23 @@ function okJson(body: unknown) {
   return { ok: true, json: () => Promise.resolve(body) };
 }
 function fail(status: number) {
-  return { ok: false, status };
+  return { ok: false, status, text: () => Promise.resolve(`error ${status}`) };
 }
 
-function scriptedPrompts(answers: string[]): OAuthLoginCallbacks {
-  const queue = [...answers];
-  const onPrompt = vi.fn(async (_p: OAuthPrompt) => {
-    const next = queue.shift();
-    return next ?? "";
-  });
+/**
+ * Create callbacks that auto-select a method via onSelect,
+ * then feed prompt answers in order via onPrompt.
+ */
+function makeCallbacks(
+  selectId: string,
+  promptAnswers: string[] = [],
+): OAuthLoginCallbacks {
+  const promptQueue = [...promptAnswers];
   return {
     onAuth: vi.fn(),
-    onPrompt,
+    onDeviceCode: vi.fn(),
+    onSelect: vi.fn(async (_p: OAuthSelectPrompt) => selectId),
+    onPrompt: vi.fn(async (_p: OAuthPrompt) => promptQueue.shift() ?? ""),
     onProgress: vi.fn(),
   };
 }
@@ -30,7 +35,15 @@ describe("loginKiro — Builder ID", () => {
 
   beforeEach(() => {
     originalFetch = global.fetch;
-    fetchMock = vi.fn();
+    fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (typeof url === "string" && url.includes("ListAvailableModels")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ models: [] }),
+        });
+      }
+      return undefined;
+    });
     global.fetch = fetchMock as unknown as typeof fetch;
   });
   afterEach(() => {
@@ -38,7 +51,7 @@ describe("loginKiro — Builder ID", () => {
     vi.useRealTimers();
   });
 
-  it("empty input triggers Builder ID device-code flow at us-east-1", async () => {
+  it("selects Builder ID → device-code flow at us-east-1", async () => {
     vi.useFakeTimers();
     fetchMock
       .mockResolvedValueOnce(okJson({ clientId: "CID", clientSecret: "SEC" }))
@@ -54,7 +67,7 @@ describe("loginKiro — Builder ID", () => {
       )
       .mockResolvedValueOnce(okJson({ accessToken: "AT", refreshToken: "RT", expiresIn: 3600 }));
 
-    const callbacks = scriptedPrompts([""]); // blank → Builder ID
+    const callbacks = makeCallbacks("builder-id");
     const promise = loginKiro(callbacks);
     await vi.runAllTimersAsync();
     const creds = await promise;
@@ -80,7 +93,15 @@ describe("loginKiro — IdC", () => {
 
   beforeEach(() => {
     originalFetch = global.fetch;
-    fetchMock = vi.fn();
+    fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (typeof url === "string" && url.includes("ListAvailableModels")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ models: [] }),
+        });
+      }
+      return undefined;
+    });
     global.fetch = fetchMock as unknown as typeof fetch;
   });
   afterEach(() => {
@@ -104,8 +125,8 @@ describe("loginKiro — IdC", () => {
       )
       .mockResolvedValueOnce(okJson({ accessToken: "AT", refreshToken: "RT", expiresIn: 3600 }));
 
-    // Two prompts: URL, then region.
-    const callbacks = scriptedPrompts([
+    // onSelect → "idc", then onPrompt → URL, region
+    const callbacks = makeCallbacks("idc", [
       "https://mycompany.awsapps.com/start",
       "eu-west-1",
     ]);
@@ -138,7 +159,11 @@ describe("loginKiro — IdC", () => {
       )
       .mockResolvedValueOnce(okJson({ accessToken: "AT", refreshToken: "RT", expiresIn: 3600 }));
 
-    const callbacks = scriptedPrompts(["https://mycompany.awsapps.com/start"]);
+    // onPrompt answers: URL, then blank region (auto-detect)
+    const callbacks = makeCallbacks("idc", [
+      "https://mycompany.awsapps.com/start",
+      "",
+    ]);
     const promise = loginKiro(callbacks);
     await vi.runAllTimersAsync();
     const creds = await promise;
@@ -146,15 +171,15 @@ describe("loginKiro — IdC", () => {
     expect(creds.region).toBe("eu-west-1");
   });
 
-  it("rejects non-URL input that isn't blank", async () => {
-    const callbacks = scriptedPrompts(["notaurl"]);
-    await expect(loginKiro(callbacks)).rejects.toThrow(/Invalid input/);
+  it("rejects non-URL input for IdC start URL", async () => {
+    const callbacks = makeCallbacks("idc", ["notaurl"]);
+    await expect(loginKiro(callbacks)).rejects.toThrow(/Invalid start URL/);
   });
 
   it("throws if no region accepts the start URL", async () => {
     // Every probed region fails registration.
     fetchMock.mockResolvedValue(fail(400));
-    const callbacks = scriptedPrompts([
+    const callbacks = makeCallbacks("idc", [
       "https://bogus.awsapps.com/start",
       "us-east-1",
     ]);
@@ -180,10 +205,13 @@ describe("loginKiro — IdC", () => {
     const onAuth = vi.fn();
     const callbacks: OAuthLoginCallbacks = {
       onAuth,
+      onDeviceCode: vi.fn(),
+      onSelect: vi.fn(async () => "idc"),
       onPrompt: vi
         .fn()
         .mockResolvedValueOnce("https://x.awsapps.com/start")
         .mockResolvedValueOnce("us-east-1"),
+      onProgress: vi.fn(),
     };
     const promise = loginKiro(callbacks);
     await vi.runAllTimersAsync();
@@ -196,10 +224,13 @@ describe("loginKiro — IdC", () => {
     expect(info.instructions).toContain("10 minutes");
   });
 
-  it("propagates cancel when onPrompt rejects at the URL prompt", async () => {
+  it("propagates cancel when onSelect returns undefined", async () => {
     const callbacks: OAuthLoginCallbacks = {
       onAuth: vi.fn(),
-      onPrompt: vi.fn().mockRejectedValueOnce(new Error("Login cancelled")),
+      onDeviceCode: vi.fn(),
+      onSelect: vi.fn(async () => undefined),
+      onPrompt: vi.fn(),
+      onProgress: vi.fn(),
     };
     await expect(loginKiro(callbacks)).rejects.toThrow("Login cancelled");
     expect(fetchMock).not.toHaveBeenCalled();
@@ -208,10 +239,13 @@ describe("loginKiro — IdC", () => {
   it("propagates cancel when onPrompt rejects at the region prompt", async () => {
     const callbacks: OAuthLoginCallbacks = {
       onAuth: vi.fn(),
+      onDeviceCode: vi.fn(),
+      onSelect: vi.fn(async () => "idc"),
       onPrompt: vi
         .fn()
         .mockResolvedValueOnce("https://x.awsapps.com/start")
         .mockRejectedValueOnce(new Error("Login cancelled")),
+      onProgress: vi.fn(),
     };
     await expect(loginKiro(callbacks)).rejects.toThrow("Login cancelled");
     expect(fetchMock).not.toHaveBeenCalled();
@@ -224,14 +258,23 @@ describe("refreshKiroToken", () => {
 
   beforeEach(() => {
     originalFetch = global.fetch;
-    fetchMock = vi.fn();
+    fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (typeof url === "string" && url.includes("ListAvailableModels")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ models: [] }),
+        });
+      }
+      return undefined;
+    });
     global.fetch = fetchMock as unknown as typeof fetch;
   });
   afterEach(() => {
     global.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
-  it("refreshes using pipe-packed credentials at the stored region", async () => {
+  it("layer 1 succeeds: refreshes using pipe-packed credentials at the stored region", async () => {
     fetchMock.mockResolvedValueOnce(
       okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
     );
@@ -258,24 +301,15 @@ describe("refreshKiroToken", () => {
     );
   });
 
-  it("throws when region is missing", async () => {
+  it("cascade exhausts all layers and throws when region is missing", async () => {
+    // All layers will fail — layer 1 fails on missing region, kiro-cli layers
+    // return null (no DB file in test env).
     await expect(
       refreshKiroToken({ refresh: "RT|CID|SEC|idc", access: "x", expires: 0 }),
-    ).rejects.toThrow(/missing clientId\/clientSecret\/region/);
+    ).rejects.toThrow(/cascade layers exhausted/);
   });
 
-  it("throws when refresh token is missing pieces", async () => {
-    await expect(
-      refreshKiroToken({
-        refresh: "just-a-token",
-        access: "x",
-        expires: 0,
-        region: "us-east-1",
-      }),
-    ).rejects.toThrow(/missing clientId/);
-  });
-
-  it("throws on HTTP failure", async () => {
+  it("cascade exhausts all layers and throws on HTTP failure with no CLI fallback", async () => {
     fetchMock.mockResolvedValueOnce(fail(401));
     await expect(
       refreshKiroToken({
@@ -284,6 +318,58 @@ describe("refreshKiroToken", () => {
         expires: 0,
         region: "us-east-1",
       }),
-    ).rejects.toThrow(/Token refresh failed/);
+    ).rejects.toThrow(/cascade layers exhausted/);
+  });
+
+  it("error message includes all layer failure reasons", async () => {
+    fetchMock.mockResolvedValueOnce(fail(500));
+    try {
+      await refreshKiroToken({
+        refresh: "RT|CID|SEC|idc",
+        access: "x",
+        expires: 0,
+        region: "us-east-1",
+      });
+      // Should not reach here
+      expect.unreachable("Expected refreshKiroToken to throw");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("L1(normal)");
+      expect(msg).toContain("cascade layers exhausted");
+    }
+  });
+
+  it("preserves authMethod through the cascade", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
+    );
+    const refreshed = await refreshKiroToken({
+      refresh: "RT|CID|SEC|builder-id",
+      access: "old",
+      expires: 0,
+      region: "us-east-1",
+      authMethod: "builder-id",
+    } as any);
+    expect(refreshed.authMethod).toBe("builder-id");
+  });
+
+  it("desktop authMethod uses the desktop endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
+    );
+    const refreshed = await refreshKiroToken({
+      refresh: "RT|||desktop",
+      access: "old",
+      expires: 0,
+      region: "us-east-1",
+      authMethod: "desktop",
+    } as any);
+    expect(refreshed.authMethod).toBe("desktop");
+    expect(refreshed.access).toBe("AT2");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 });
+

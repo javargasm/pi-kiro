@@ -3,8 +3,8 @@
 // Import via: `import { loginKiro, streamKiro, ... } from "pi-kiro/core"`.
 //
 // The full pi extension lives at package root (".") and depends on
-// @mariozechner/pi-coding-agent. This subpath imports only
-// @mariozechner/pi-ai (types + stream helpers), so apps embedding the
+// @earendil-works/pi-coding-agent. This subpath imports only
+// @earendil-works/pi-ai (types + stream helpers), so apps embedding the
 // Kiro provider into their own UI (e.g. an opentui frontend, a server
 // backend) don't need pi-coding-agent installed.
 //
@@ -30,5 +30,15 @@ export {
 	kiroModels,
 	resolveApiRegion,
 	resolveKiroModel,
+	resolveRuntimeUrl,
 } from "./models";
 export type { KiroModel } from "./models";
+
+export { isPermanentError } from "./health";
+export {
+	importFromKiroCli,
+	getKiroCliCredentialsAllowExpired,
+	saveKiroCliCredentials,
+} from "./kiro-cli-sync";
+export type { KiroCliCredentials } from "./kiro-cli-sync";
+export { MAX_KIRO_IMAGES, MAX_KIRO_IMAGE_BYTES, collapseAgenticLoops } from "./transform";

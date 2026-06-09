@@ -8,7 +8,7 @@
 // Live mode: set `KIRO_LIVE_TEST=1` and provide `KIRO_ACCESS_TOKEN` to run
 // against the real Kiro API. Without those the suites skip with a message.
 
-import type { Api, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { kiroModels } from "../../src/models";
 import { streamKiro } from "../../src/stream";
 

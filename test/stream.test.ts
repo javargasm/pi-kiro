@@ -4,7 +4,10 @@ import type {
   AssistantMessageEvent,
   Context,
   Model,
-} from "@mariozechner/pi-ai";
+  Tool,
+  ToolResultMessage,
+  UserMessage,
+} from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HIDDEN_REASONING_COUNTDOWN_MS, resetProfileArnCache, streamKiro } from "../src/stream";
 
@@ -29,6 +32,52 @@ function makeContext(userMsg = "Hello"): Context {
     systemPrompt: "You are helpful",
     messages: [{ role: "user", content: userMsg, timestamp: Date.now() }],
     tools: [],
+  };
+}
+
+const ts = Date.now();
+const zeroUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function user(content: string): UserMessage {
+  return { role: "user", content, timestamp: ts };
+}
+
+function assistantWithToolCall(): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [
+      { type: "text", text: "SECRET_ASSISTANT_TEXT" },
+      {
+        type: "toolCall",
+        id: "tc1",
+        name: "bash",
+        arguments: { cmd: "ls", secret: "SECRET_ARG" },
+      },
+    ],
+    api: "kiro-api",
+    provider: "kiro",
+    model: "test",
+    usage: zeroUsage,
+    stopReason: "toolUse",
+    timestamp: ts,
+  };
+}
+
+function toolResult(id: string, text: string): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: id,
+    toolName: "bash",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp: ts,
   };
 }
 
@@ -105,6 +154,114 @@ describe("streamKiro", () => {
     );
     expect(opts.headers["x-amzn-kiro-agent-mode"]).toBe("vibe");
     expect(opts.headers["Content-Type"]).toBe("application/x-amz-json-1.0");
+  });
+
+  it("logs safe request.shape diagnostics for tool-use format errors", async () => {
+    const originalLevel = process.env.KIRO_LOG;
+    process.env.KIRO_LOG = "debug";
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        text: () => Promise.resolve('{"message":"Invalid tool use format."}'),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const tool: Tool = {
+        name: "bash",
+        description: "Run shell commands",
+        parameters: {
+          type: "object",
+          properties: { cmd: { type: "string" } },
+          required: ["cmd"],
+          additionalProperties: false,
+        },
+      };
+      const context: Context = {
+        systemPrompt: "SECRET_SYSTEM_PROMPT",
+        messages: [
+          user("SECRET_USER_PROMPT"),
+          assistantWithToolCall(),
+          toolResult("tc1", "SECRET_TOOL_RESULT"),
+          user("please continue"),
+        ],
+        tools: [tool],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const shapeCall = logSpy.mock.calls.find((call) => String(call[0]).includes("request.shape"));
+      expect(shapeCall).toBeDefined();
+      const shape = shapeCall?.[1] as Record<string, unknown>;
+      expect(shape).toMatchObject({
+        historyLen: expect.any(Number),
+        current: {
+          toolSpecNames: ["bash"],
+        },
+      });
+      const shapeJson = JSON.stringify(shape);
+      expect(shapeJson).toContain("tooluse_");
+      expect(shapeJson).not.toContain("SECRET_USER_PROMPT");
+      expect(shapeJson).not.toContain("SECRET_TOOL_RESULT");
+      expect(shapeJson).not.toContain("SECRET_SYSTEM_PROMPT");
+      expect(shapeJson).not.toContain("SECRET_ARG");
+
+      const errorCall = logSpy.mock.calls.find((call) => String(call[0]).includes("response.error"));
+      expect(errorCall?.[1]).toMatchObject({
+        status: 400,
+        requestShape: shape,
+      });
+    } finally {
+      logSpy.mockRestore();
+      if (originalLevel === undefined) delete process.env.KIRO_LOG;
+      else process.env.KIRO_LOG = originalLevel;
+    }
+  });
+
+  it("canonicalizes current-turn tool IDs before sending to Kiro", async () => {
+    const rawId = "call_currentTool|fc_currentFrame";
+    const fetchMock = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", fetchMock);
+
+    const assistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: rawId, name: "bash", arguments: { cmd: "pwd" } }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "test",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const result: ToolResultMessage = {
+      role: "toolResult",
+      toolCallId: rawId,
+      toolName: "bash",
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [user("run pwd"), assistant, result],
+      tools: [],
+    };
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    const history = body.conversationState.history as Array<{
+      assistantResponseMessage?: { toolUses?: Array<{ toolUseId: string }> };
+    }>;
+    const assistantToolUse = history.find((entry) => entry.assistantResponseMessage?.toolUses)
+      ?.assistantResponseMessage?.toolUses?.[0];
+    const currentToolResult = body.conversationState.currentMessage.userInputMessage
+      .userInputMessageContext.toolResults[0];
+
+    expect(assistantToolUse?.toolUseId).toMatch(/^tooluse_[a-f0-9]{22}$/);
+    expect(assistantToolUse?.toolUseId).toBe(currentToolResult.toolUseId);
+    expect(JSON.stringify(body)).not.toContain(rawId);
   });
 
   it("parses text + contextUsage into usage", async () => {
@@ -257,66 +414,41 @@ describe("streamKiro", () => {
       expect(content).not.toContain("<max_thinking_length>");
     });
 
-    it("fast response emits thinking_start/end with no delta", async () => {
-      // Mirrors the captured 4.7 wire shape: plain text content frames only,
-      // no <thinking> tags. In the test environment, mock reader resolves
-      // synchronously so the first `content` event fires well under the
-      // 2000ms countdown — no marker delta should be emitted.
+    it("fast response emits no shim: content only, no thinking events", async () => {
+      // Fast path: content arrives well before HIDDEN_REASONING_COUNTDOWN_MS.
+      // The shim timer is cancelled on first content, so zero
+      // thinking_* events fire — the response reads as plain text.
       vi.stubGlobal(
         "fetch",
         mockFetchOk('{"content":"Hi"}{"content":"!"}{"contextUsagePercentage":5}'),
       );
       const events = await collect(streamKiro(hiddenModel(), makeContext(), { apiKey: "tok" }));
 
-      // Event order: start → thinking_start → thinking_end →
-      // text_start → text_delta+ → text_end → done. No thinking_delta.
       const types = events.map((e) => e.type);
       const startIdx = types.indexOf("start");
-      const thinkingStartIdx = types.indexOf("thinking_start");
-      const thinkingEndIdx = types.indexOf("thinking_end");
       const textStartIdx = types.indexOf("text_start");
       const textEndIdx = types.indexOf("text_end");
       const doneIdx = types.indexOf("done");
 
       expect(startIdx).toBeGreaterThanOrEqual(0);
-      expect(thinkingStartIdx).toBeGreaterThan(startIdx);
-      expect(thinkingEndIdx).toBeGreaterThan(thinkingStartIdx);
-      expect(textStartIdx).toBeGreaterThan(thinkingEndIdx);
+      expect(textStartIdx).toBeGreaterThan(startIdx);
       expect(textEndIdx).toBeGreaterThan(textStartIdx);
       expect(doneIdx).toBeGreaterThan(textEndIdx);
 
-      // Zero thinking_delta events — fast path cancels the countdown
-      // before the marker can fire.
-      const thinkingDeltas = events.filter((e) => e.type === "thinking_delta");
-      expect(thinkingDeltas).toHaveLength(0);
-
-      // Content indices: thinking block at 0, text block at 1.
-      const ts = events.find((e) => e.type === "thinking_start");
-      const te = events.find((e) => e.type === "thinking_end");
-      expect(ts?.type === "thinking_start" && ts.contentIndex).toBe(0);
-      expect(te?.type === "thinking_end" && te.contentIndex).toBe(0);
-      if (te?.type === "thinking_end") {
-        expect(te.content).toBe("");
-      }
+      // No thinking_* events at all on fast responses.
+      expect(types.filter((t) => t === "thinking_start")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_delta")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_end")).toHaveLength(0);
 
       const textStart = events.find((e) => e.type === "text_start");
-      expect(textStart?.type === "text_start" && textStart.contentIndex).toBe(1);
+      expect(textStart?.type === "text_start" && textStart.contentIndex).toBe(0);
 
-      // Final message: empty redacted thinking block followed by text.
-      // Clients drop the empty-thinking block via their existing
-      // empty-text predicate (inkstone, pi-coding-agent, OpenCode).
       const done = events.find((e) => e.type === "done");
       expect(done?.type).toBe("done");
       if (done?.type === "done") {
         const msg: AssistantMessage = done.message;
-        expect(msg.content).toHaveLength(2);
-        const thinking = msg.content[0];
-        expect(thinking?.type).toBe("thinking");
-        if (thinking?.type === "thinking") {
-          expect(thinking.thinking).toBe("");
-          expect(thinking.redacted).toBe(true);
-        }
-        const text = msg.content[1];
+        expect(msg.content).toHaveLength(1);
+        const text = msg.content[0];
         expect(text?.type).toBe("text");
         if (text?.type === "text") {
           expect(text.text).toBe("Hi!");
@@ -324,9 +456,11 @@ describe("streamKiro", () => {
       }
     });
 
-    it("does not pass content through ThinkingTagParser (literal tags preserved)", async () => {
-      // If the parser were active, "<thinking>x</thinking>" would be stripped.
-      // Under reasoningHidden it must reach the text block verbatim.
+    it("leaked <thinking> tags split into thinking + text blocks", async () => {
+      // The ThinkingTagParser runs unconditionally — if Opus 4.7
+      // leaks a tag through the adaptive-thinking policy, it's
+      // parsed into a proper thinking block instead of rendered
+      // verbatim as text.
       vi.stubGlobal(
         "fetch",
         mockFetchOk(
@@ -337,21 +471,23 @@ describe("streamKiro", () => {
       const done = events.find((e) => e.type === "done");
       expect(done?.type).toBe("done");
       if (done?.type === "done") {
-        const text = done.message.content.find((c) => c.type === "text");
+        expect(done.message.content).toHaveLength(2);
+        const thinking = done.message.content[0];
+        expect(thinking?.type).toBe("thinking");
+        if (thinking?.type === "thinking") {
+          expect(thinking.thinking).toBe("x");
+        }
+        const text = done.message.content[1];
         expect(text?.type).toBe("text");
         if (text?.type === "text") {
-          expect(text.text).toBe("<thinking>x</thinking>answer");
+          expect(text.text).toBe("answer");
         }
-        // Exactly one thinking block (the shim). Fast path → empty.
-        const thinkingBlocks = done.message.content.filter((c) => c.type === "thinking");
-        expect(thinkingBlocks).toHaveLength(1);
       }
     });
 
-    it("fast response closes thinking before first tool call with no delta", async () => {
-      // No preceding `content` frame — model goes straight to a tool call.
-      // The block must close before any toolcall_* events. Fast path so
-      // no marker delta fires.
+    it("fast tool-call response emits no shim before tool events", async () => {
+      // Fast path straight to a tool call — no content, no shim.
+      // The shim timer is cancelled on the first tool event.
       const toolPayload =
         '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
       vi.stubGlobal(
@@ -361,30 +497,48 @@ describe("streamKiro", () => {
       const events = await collect(streamKiro(hiddenModel(), makeContext(), { apiKey: "tok" }));
 
       const types = events.map((e) => e.type);
-      const thinkingStartIdx = types.indexOf("thinking_start");
-      const thinkingEndIdx = types.indexOf("thinking_end");
       const toolStartIdx = types.indexOf("toolcall_start");
 
-      expect(thinkingStartIdx).toBeGreaterThanOrEqual(0);
-      expect(thinkingEndIdx).toBeGreaterThan(thinkingStartIdx);
-      expect(toolStartIdx).toBeGreaterThan(thinkingEndIdx);
-
-      const thinkingDeltas = events.filter((e) => e.type === "thinking_delta");
-      expect(thinkingDeltas).toHaveLength(0);
+      // No thinking_* events at all — tool call arrived before the
+      // shim countdown could fire.
+      expect(types.filter((t) => t === "thinking_start")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_delta")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_end")).toHaveLength(0);
+      expect(toolStartIdx).toBeGreaterThan(types.indexOf("start"));
 
       const done = events.find((e) => e.type === "done");
       expect(done?.type).toBe("done");
       if (done?.type === "done") {
         expect(done.reason).toBe("toolUse");
-        expect(done.message.content[0]?.type).toBe("thinking");
-        expect(done.message.content[1]?.type).toBe("toolCall");
+        expect(done.message.content[0]?.type).toBe("toolCall");
       }
     });
 
-    it("slow response emits marker delta after countdown then closes empty", async () => {
-      // Delay the first chunk past the 2000ms countdown. The countdown
-      // should fire and emit the marker delta before the content arrives.
-      // After content streams, thinking_end closes with empty content.
+    it("strips __tool_use_purpose from tool call arguments", async () => {
+      const toolPayload =
+        '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\",\\"__tool_use_purpose\\":\\"test\\"}","stop":true}';
+      vi.stubGlobal(
+        "fetch",
+        mockFetchOk(`${toolPayload}{"contextUsagePercentage":5}`),
+      );
+      const events = await collect(streamKiro(hiddenModel(), makeContext(), { apiKey: "tok" }));
+
+      const done = events.find((e) => e.type === "done");
+      expect(done?.type === "done").toBe(true);
+      if (done?.type === "done") {
+        const tc = done.message.content[0];
+        expect(tc?.type).toBe("toolCall");
+        if (tc?.type === "toolCall") {
+          expect(tc.arguments).toEqual({ cmd: "ls" });
+        }
+      }
+    });
+
+    it("slow response emits complete shim after countdown", async () => {
+      // When nothing arrives within HIDDEN_REASONING_COUNTDOWN_MS,
+      // the timer fires a complete shim (start + delta + end) in one
+      // flush. Content that arrives afterwards lands at a later
+      // contentIndex.
       let resolveFirst: ((value: { done: boolean; value?: Uint8Array }) => void) | undefined;
       const firstPromise = new Promise<{ done: boolean; value?: Uint8Array }>((res) => {
         resolveFirst = res;
@@ -408,8 +562,7 @@ describe("streamKiro", () => {
         streamKiro(hiddenModel(), makeContext(), { apiKey: "tok" }),
       );
 
-      // Advance past the countdown threshold. The timer callback runs
-      // and emits the marker delta synchronously.
+      // Advance past the countdown threshold so the shim fires.
       await vi.advanceTimersByTimeAsync(HIDDEN_REASONING_COUNTDOWN_MS + 50);
 
       // Now resolve the reader with the actual payload.
@@ -421,32 +574,38 @@ describe("streamKiro", () => {
       const events = await streamPromise;
       vi.useRealTimers();
 
-      // thinking_delta must appear, carry the placeholder, and precede
-      // any text event.
-      const deltaIdx = events.findIndex((e) => e.type === "thinking_delta");
-      const textStartIdx = events.findIndex((e) => e.type === "text_start");
-      expect(deltaIdx).toBeGreaterThanOrEqual(0);
-      expect(deltaIdx).toBeLessThan(textStartIdx);
-
-      const delta = events[deltaIdx];
-      if (delta?.type === "thinking_delta") {
-        expect(delta.delta).toBe("Reasoning hidden by provider");
-        expect(delta.contentIndex).toBe(0);
+      // The shim is a complete start + delta + end triple at
+      // contentIndex 0, all carrying the placeholder.
+      const shimStart = events.find((e) => e.type === "thinking_start");
+      const shimDelta = events.find((e) => e.type === "thinking_delta");
+      const shimEnd = events.find((e) => e.type === "thinking_end");
+      expect(shimStart?.type === "thinking_start" && shimStart.contentIndex).toBe(0);
+      expect(shimDelta?.type === "thinking_delta" && shimDelta.contentIndex).toBe(0);
+      expect(shimEnd?.type === "thinking_end" && shimEnd.contentIndex).toBe(0);
+      if (shimDelta?.type === "thinking_delta") {
+        expect(shimDelta.delta).toBe("Reasoning hidden by provider");
+      }
+      if (shimEnd?.type === "thinking_end") {
+        expect(shimEnd.content).toBe("");
       }
 
-      // thinking_end closes with empty content regardless of whether
-      // the marker fired — accumulated text lives on the block itself.
-      const te = events.find((e) => e.type === "thinking_end");
-      if (te?.type === "thinking_end") {
-        expect(te.content).toBe("");
-      }
+      // Shim ordering: all three shim events precede text_start.
+      const types = events.map((e) => e.type);
+      const textStartIdx = types.indexOf("text_start");
+      expect(types.indexOf("thinking_end")).toBeLessThan(textStartIdx);
 
       const done = events.find((e) => e.type === "done");
       if (done?.type === "done") {
+        // Shim at [0], text at [1].
+        expect(done.message.content).toHaveLength(2);
         const thinking = done.message.content[0];
         if (thinking?.type === "thinking") {
           expect(thinking.thinking).toBe("Reasoning hidden by provider");
           expect(thinking.redacted).toBe(true);
+        }
+        const text = done.message.content[1];
+        if (text?.type === "text") {
+          expect(text.text).toBe("Hi");
         }
       }
     }, 10000);
@@ -491,22 +650,27 @@ describe("streamKiro", () => {
       const events = await streamPromise;
       vi.useRealTimers();
 
-      const thinkingDeltas = events.filter((e) => e.type === "thinking_delta");
-      expect(thinkingDeltas).toHaveLength(0);
+      // Shim timer was cancelled on first content → no thinking_*
+      // events at all.
+      const types = events.map((e) => e.type);
+      expect(types.filter((t) => t === "thinking_start")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_delta")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_end")).toHaveLength(0);
 
       const done = events.find((e) => e.type === "done");
       if (done?.type === "done") {
-        const thinking = done.message.content[0];
-        if (thinking?.type === "thinking") {
-          expect(thinking.thinking).toBe("");
+        // No thinking block — text at content[0].
+        expect(done.message.content).toHaveLength(1);
+        const text = done.message.content[0];
+        if (text?.type === "text") {
+          expect(text.text).toBe("Hi");
         }
       }
     }, 10000);
 
-    it("closes live indicator with empty content on terminal error", async () => {
-      // Simulate an immediate stream error on every attempt. The terminal
-      // error event must be preceded by a thinking_end with empty content
-      // so downstream UIs don't hang with a live indicator.
+    it("terminal error cancels pending shim (no stray shim event)", async () => {
+      // Stream error before the countdown would fire. The shim timer
+      // is cancelled in the error handler; no thinking events fire.
       const errorBody = '{"error":"ThrottlingException","message":"Rate limit"}';
       const makeReader = () => ({
         read: vi
@@ -531,19 +695,12 @@ describe("streamKiro", () => {
       const errIdx = events.findIndex((e) => e.type === "error");
       expect(errIdx).toBeGreaterThanOrEqual(0);
 
-      // Walk backward from `error` to find the last thinking_end.
-      let lastThinkingEndIdx = -1;
-      for (let i = errIdx - 1; i >= 0; i--) {
-        if (events[i]?.type === "thinking_end") {
-          lastThinkingEndIdx = i;
-          break;
-        }
-      }
-      expect(lastThinkingEndIdx).toBeGreaterThanOrEqual(0);
-      const lastEnd = events[lastThinkingEndIdx];
-      if (lastEnd?.type === "thinking_end") {
-        expect(lastEnd.content).toBe("");
-      }
+      // No thinking_* events anywhere in the error path — the shim
+      // timer was cancelled cleanly without firing.
+      const types = events.map((e) => e.type);
+      expect(types.filter((t) => t === "thinking_start")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_delta")).toHaveLength(0);
+      expect(types.filter((t) => t === "thinking_end")).toHaveLength(0);
     }, 30000);
   });
 
@@ -578,4 +735,268 @@ describe("streamKiro", () => {
       expect(err.error.errorMessage).toMatch(/ThrottlingException/);
     }
   }, 30000);
+
+  describe("context truncation on too-big errors", () => {
+    function makeContextWithHistory(turns: number): Context {
+      const messages: Context["messages"] = [];
+      for (let i = 0; i < turns; i++) {
+        messages.push({ role: "user", content: `msg ${i}`, timestamp: Date.now() });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: `reply ${i}` }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        });
+      }
+      // Final user message (current turn)
+      messages.push({ role: "user", content: "current question", timestamp: Date.now() });
+      return { systemPrompt: "You are helpful", messages, tools: [] };
+    }
+
+    it("retries with truncated history on 413", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const fetchMock = vi.fn()
+        // First call: 413
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 413,
+          statusText: "Too Large",
+          text: () => Promise.resolve("too big"),
+        })
+        // Second call: success
+        .mockResolvedValueOnce({
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi.fn()
+                .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"content":"Hi"}{"contextUsagePercentage":5}') })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+            }),
+          },
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = makeContextWithHistory(5);
+      const events = await collect(streamKiro(makeModel(), ctx, { apiKey: "tok" }));
+      vi.useRealTimers();
+
+      // Should have made 2 calls — first 413, then success
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // Second request should have fewer history entries
+      const firstBody = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const secondBody = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string);
+      const firstHistoryLen = firstBody.conversationState.history?.length ?? 0;
+      const secondHistoryLen = secondBody.conversationState.history?.length ?? 0;
+      expect(secondHistoryLen).toBeLessThan(firstHistoryLen);
+
+      const done = events.find((e) => e.type === "done");
+      expect(done?.type).toBe("done");
+    }, 30000);
+
+    it("gives up after max truncation retries", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 413,
+        statusText: "Too Large",
+        text: () => Promise.resolve("too big"),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = makeContextWithHistory(20);
+      const events = await collect(streamKiro(makeModel(), ctx, { apiKey: "tok" }));
+      vi.useRealTimers();
+
+      const err = events.find((e) => e.type === "error");
+      expect(err?.type).toBe("error");
+      if (err?.type === "error") {
+        expect(err.error.errorMessage).toMatch(/context_length_exceeded/);
+      }
+    }, 30000);
+
+    it("throws after truncating seed-only history on too-big error", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        text: () => Promise.resolve("CONTENT_LENGTH_EXCEEDS_THRESHOLD"),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      // Single message → empty user history, but seed pair adds 2 entries.
+      // Truncation strips them before reaching the terminal error.
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+      const err = events.find((e) => e.type === "error");
+      expect(err?.type).toBe("error");
+      if (err?.type === "error") {
+        expect(err.error.errorMessage).toMatch(/context_length_exceeded/);
+      }
+      // 1 initial + 2 truncation retries (seed pair shrinks to 0) = 3
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe("transient error retry (429/5xx)", () => {
+    it("retries on 429 with backoff and succeeds", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const fetchMock = vi.fn()
+        // First: 429
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          statusText: "Too Many Requests",
+          text: () => Promise.resolve("rate limit"),
+        })
+        // Second: success
+        .mockResolvedValueOnce({
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi.fn()
+                .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"content":"Hi"}{"contextUsagePercentage":5}') })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+            }),
+          },
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      vi.useRealTimers();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const done = events.find((e) => e.type === "done");
+      expect(done?.type).toBe("done");
+    }, 30000);
+
+    it("retries on 500 with backoff and succeeds", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 500,
+          statusText: "Internal Server Error",
+          text: () => Promise.resolve("internal error"),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi.fn()
+                .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"content":"Ok"}{"contextUsagePercentage":5}') })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+            }),
+          },
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      vi.useRealTimers();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const done = events.find((e) => e.type === "done");
+      expect(done?.type).toBe("done");
+    }, 30000);
+
+    it("gives up after max transient retries on 429", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        text: () => Promise.resolve("rate limit"),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      vi.useRealTimers();
+
+      // 1 initial + 3 retries = 4 total
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const err = events.find((e) => e.type === "error");
+      expect(err?.type).toBe("error");
+      if (err?.type === "error") {
+        expect(err.error.errorMessage).toMatch(/429/);
+      }
+    }, 30000);
+  });
+
+  describe("additionalModelRequestFields (effort)", () => {
+    it("sends effort for models with supportedEfforts (Opus 4.8)", async () => {
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+      await collect(
+        streamKiro(
+          makeModel({
+            id: "claude-opus-4-8",
+            reasoning: true,
+            ...({ reasoningHidden: true, supportedEfforts: ["low", "medium", "high", "xhigh", "max"] } as unknown as Partial<Model<Api>>),
+          }),
+          makeContext(),
+          { apiKey: "tok", reasoning: "high" },
+        ),
+      );
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      expect(body.additionalModelRequestFields).toBeDefined();
+      expect(body.additionalModelRequestFields.output_config.effort).toBe("xhigh");
+    });
+
+    it("maps pi xhigh to kiro max", async () => {
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+      await collect(
+        streamKiro(
+          makeModel({
+            id: "claude-opus-4-8",
+            reasoning: true,
+            ...({ reasoningHidden: true, supportedEfforts: ["low", "medium", "high", "xhigh", "max"] } as unknown as Partial<Model<Api>>),
+          }),
+          makeContext(),
+          { apiKey: "tok", reasoning: "xhigh" },
+        ),
+      );
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      expect(body.additionalModelRequestFields.output_config.effort).toBe("max");
+    });
+
+    it("does not send effort for models without supportedEfforts (Haiku)", async () => {
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+      await collect(
+        streamKiro(
+          makeModel({ id: "claude-haiku-4-5", reasoning: false }),
+          makeContext(),
+          { apiKey: "tok", reasoning: "high" },
+        ),
+      );
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    });
+
+    it("does not send effort when reasoning is not set", async () => {
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+      await collect(
+        streamKiro(
+          makeModel({
+            id: "claude-opus-4-8",
+            reasoning: true,
+            ...({ reasoningHidden: true, supportedEfforts: ["low", "medium", "high", "xhigh", "max"] } as unknown as Partial<Model<Api>>),
+          }),
+          makeContext(),
+          { apiKey: "tok" },
+        ),
+      );
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    });
+  });
 });

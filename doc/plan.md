@@ -1,5 +1,16 @@
 # pi-kiro Design Plan
 
+> **Status note (post-rewrite drift).** This document records the *original*
+> greenfield-rewrite plan. Some scope that was dropped here was later
+> reintroduced as the package matured against real Kiro CLI behavior:
+> IAM Identity Center login, the Kiro IDE SQLite credential sync
+> (`kiro-cli-sync.ts`), and a multi-layer credential refresh path all exist
+> today. Static native tool schemas (`kiro-tools.ts`) and captured client
+> identity defaults (`kiro-defaults.ts`) were also added for request
+> fidelity. Treat `doc/architecture.md` and `doc/conformance.md` as the
+> current source of truth; the sections below are kept as a design-history
+> record, not a description of the present file set.
+
 ## Why a new package
 
 `pi-provider-kiro` (3,349 lines) accumulated a lot of scaffolding that pi-mono

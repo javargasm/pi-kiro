@@ -78,6 +78,22 @@ describe("parseKiroEvent", () => {
       data: "p",
     });
   });
+  it("returns reasoning event with text and signature", () => {
+    const e = parseKiroEvent({
+      reasoningText: { text: "I should search for this", signature: "abc123" },
+    });
+    expect(e).toEqual({
+      type: "reasoning",
+      data: { text: "I should search for this", signature: "abc123" },
+    });
+  });
+  it("returns reasoning event without signature", () => {
+    const e = parseKiroEvent({ reasoningText: { text: "thinking..." } });
+    expect(e).toEqual({
+      type: "reasoning",
+      data: { text: "thinking...", signature: undefined },
+    });
+  });
   it("returns null for unknown shapes", () => {
     expect(parseKiroEvent({ random: "key" })).toBeNull();
   });
@@ -115,5 +131,16 @@ describe("parseKiroEvents", () => {
 
   it("handles empty buffer", () => {
     expect(parseKiroEvents("")).toEqual({ events: [], remaining: "" });
+  });
+
+  it("extracts reasoning events from buffer", () => {
+    const buf = '{"reasoningText":{"text":"Let me think","signature":"sig1"}}{"content":"result"}';
+    const { events } = parseKiroEvents(buf);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toEqual({
+      type: "reasoning",
+      data: { text: "Let me think", signature: "sig1" },
+    });
+    expect(events[1]).toEqual({ type: "content", data: "result" });
   });
 });

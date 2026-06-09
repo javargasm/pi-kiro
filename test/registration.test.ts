@@ -1,6 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
 import registerExtension from "../src/extension";
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: (path: string) => {
+      if (typeof path === "string" && path.includes("auth.json")) {
+        return false;
+      }
+      return actual.existsSync(path);
+    },
+  };
+});
+
 describe("extension registration", () => {
   it("calls pi.registerProvider with 'kiro' and all documented fields", async () => {
     const registerProvider = vi.fn();
@@ -15,7 +28,7 @@ describe("extension registration", () => {
     expect(registerProvider).toHaveBeenCalledOnce();
     const [name, config] = registerProvider.mock.calls[0] as [string, Record<string, unknown>];
     expect(name).toBe("kiro");
-    expect(config.baseUrl).toBe("https://q.us-east-1.amazonaws.com/generateAssistantResponse");
+    expect(config.baseUrl).toBe("https://runtime.us-east-1.kiro.dev");
     expect(config.api).toBe("kiro-api");
     expect(Array.isArray(config.models)).toBe(true);
     expect((config.models as unknown[]).length).toBeGreaterThan(0);
@@ -101,7 +114,7 @@ describe("extension registration", () => {
     for (const m of scoped) {
       if (m.provider === "kiro") {
         expect(m.baseUrl).toBe(
-          "https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
+          "https://runtime.eu-central-1.kiro.dev",
         );
       }
     }

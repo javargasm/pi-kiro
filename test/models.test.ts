@@ -48,7 +48,7 @@ describe("resolveApiRegion", () => {
   });
 
   it("passes through unmapped regions", () => {
-    expect(resolveApiRegion("ap-southeast-1")).toBe("ap-southeast-1");
+    expect(resolveApiRegion("me-south-1")).toBe("me-south-1");
   });
 });
 
@@ -77,7 +77,7 @@ describe("kiroModels catalog", () => {
     for (const m of kiroModels) {
       expect(m.api).toBe("kiro-api");
       expect(m.provider).toBe("kiro");
-      expect(m.baseUrl).toBe("https://q.us-east-1.amazonaws.com/generateAssistantResponse");
+      expect(m.baseUrl).toBe("https://runtime.us-east-1.kiro.dev");
       expect(m.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     }
   });

@@ -25,6 +25,6 @@ jobs:
       # with npm 10.x, so upgrade the global npm CLI before publishing.
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
-      - run: bun run typecheck
-      - run: bun run test
+      - run: bun run check
+      - run: bun run build
       - run: npm publish

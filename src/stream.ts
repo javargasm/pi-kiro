@@ -8,27 +8,28 @@ import type {
   AssistantMessageEventStream,
   Context,
   ImageContent,
-  Message,
   Model,
   SimpleStreamOptions,
   TextContent,
   ThinkingContent,
   ToolCall,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
+import { isPermanentError } from "./health";
 import type { KiroModel } from "./models";
-import { kiroModels, resolveKiroModel } from "./models";
+import { kiroModels, resolveKiroModel, getCachedDynamicModels } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
+
 import {
   buildHistory,
   convertImagesToKiro,
-  convertToolsToKiro,
   extractImages,
   getContentText,
+  type KiroEnvState,
   type KiroHistoryEntry,
   type KiroImage,
   type KiroToolResult,
@@ -36,20 +37,34 @@ import {
   type KiroUserInputMessage,
   normalizeMessages,
   parseToolArgs,
+  toKiroToolUseId,
   TOOL_RESULT_LIMIT,
   truncate,
 } from "./transform";
+import {
+  COMPACTION_THRESHOLD_PCT,
+  resolveOS,
+  SYSTEM_SEED_ACK,
+  SYSTEM_SEED_INSTRUCTION,
+} from "./kiro-defaults";
 
 // ---- Retry / timeout constants -----------------------------------------
 
 const FIRST_TOKEN_TIMEOUT_DEFAULT_MS = 90_000;
-const IDLE_TIMEOUT_MS = 300_000;
+const IDLE_TIMEOUT_MS = 60_000;
 const MAX_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
 
 const CAPACITY_MAX_RETRIES = 3;
 const CAPACITY_BASE_DELAY_MS = 5_000;
 const CAPACITY_MAX_DELAY_MS = 30_000;
+
+const TRANSIENT_MAX_RETRIES = 3;
+const TRANSIENT_BASE_DELAY_MS = 2_000;
+const TRANSIENT_MAX_DELAY_MS = 15_000;
+
+const CONTEXT_TRUNCATION_MAX_RETRIES = 3;
+const CONTEXT_TRUNCATION_DROP_RATIO = 0.3;
 
 const TOO_BIG_PATTERNS = ["CONTENT_LENGTH_EXCEEDS_THRESHOLD", "Input is too long", "Improperly formed"];
 const NON_RETRYABLE_BODY_PATTERNS = ["MONTHLY_REQUEST_COUNT"];
@@ -71,6 +86,10 @@ function isCapacityError(body: string): boolean {
   return body.includes(CAPACITY_PATTERN);
 }
 
+function isTransientError(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
 function firstTokenTimeoutForModel(modelId: string): number {
   const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
   return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
@@ -88,80 +107,50 @@ function firstTokenTimeoutForModel(modelId: string): number {
 const HIDDEN_REASONING_PLACEHOLDER = "Reasoning hidden by provider";
 
 /**
- * How long to wait after `thinking_start` before emitting the user-visible
- * marker delta. Shorter than a typical user's "is this hung?" threshold so
- * the marker appears exactly when the wait starts feeling palpable, but
- * long enough that fast responses never flash the marker.
+ * How long to wait after `start` before emitting the lazy
+ * hidden-reasoning breadcrumb. Short enough that the marker appears
+ * exactly when a wait starts feeling palpable, long enough that fast
+ * responses never flash it. Content / tool-call events cancel the
+ * timer, so the breadcrumb only fires when nothing else arrives in
+ * time.
  */
 export const HIDDEN_REASONING_COUNTDOWN_MS = 2000;
 
 /**
- * Open a redacted ThinkingContent block at the start of the stream. The
- * block begins with empty `thinking` text so every pi-ai-compatible UI
- * treats it as a live indicator. The block is either closed empty (fast
- * path) or has `emitHiddenReasoningMarker` mutate it mid-stream (slow
- * path) before closing.
+ * Emit a complete hidden-reasoning breadcrumb as a single flush:
+ * `thinking_start` + `thinking_delta(marker)` + `thinking_end`. The
+ * block carries `redacted: true` so downstream UIs can drop it by
+ * placeholder or marker predicate — Inkstone drops it via its
+ * `REDACTED_THINKING_PLACEHOLDERS` filter.
  *
- * Returns the `contentIndex` of the pushed block.
+ * Called only from the slow-path countdown timer: content and tool
+ * events cancel the timer so this never fires when real output
+ * arrived in time.
  */
-function emitHiddenReasoningStart(
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-): number {
-  const contentIndex = output.content.length;
-  const block: ThinkingContent = {
-    type: "thinking",
-    thinking: "",
-    redacted: true,
-  };
-  output.content.push(block);
-  stream.push({ type: "thinking_start", contentIndex, partial: output });
-  return contentIndex;
-}
-
-/**
- * Populate an open redacted-thinking block with the placeholder marker.
- * Fires from the countdown timer when the first real output event hasn't
- * arrived within `HIDDEN_REASONING_COUNTDOWN_MS`. Mutates the block in
- * place and emits a single `thinking_delta` so UIs that render accumulated
- * thinking text (inkstone, pi-coding-agent) display the marker until
- * `thinking_end` arrives.
- */
-function emitHiddenReasoningMarker(
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-  contentIndex: number,
+function emitHiddenReasoningLate(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
 ): void {
-  const block = output.content[contentIndex];
-  if (block && block.type === "thinking") {
-    block.thinking = HIDDEN_REASONING_PLACEHOLDER;
-  }
-  stream.push({
-    type: "thinking_delta",
-    contentIndex,
-    delta: HIDDEN_REASONING_PLACEHOLDER,
-    partial: output,
-  });
-}
-
-/**
- * Close a block previously opened by `emitHiddenReasoningStart`. Always
- * emits `thinking_end` with empty content — the accumulated text (if any)
- * lives on `output.content[contentIndex].thinking`. UIs that drop
- * redacted-thinking blocks do so either via an empty-text check or via a
- * known-placeholder predicate; both shapes work with empty `content`.
- */
-function closeHiddenReasoning(
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-  contentIndex: number,
-): void {
-  stream.push({
-    type: "thinking_end",
-    contentIndex,
-    content: "",
-    partial: output,
-  });
+	const contentIndex = output.content.length;
+	const block: ThinkingContent = {
+		type: "thinking",
+		thinking: HIDDEN_REASONING_PLACEHOLDER,
+		redacted: true,
+	};
+	output.content.push(block);
+	stream.push({ type: "thinking_start", contentIndex, partial: output });
+	stream.push({
+		type: "thinking_delta",
+		contentIndex,
+		delta: HIDDEN_REASONING_PLACEHOLDER,
+		partial: output,
+	});
+	stream.push({
+		type: "thinking_end",
+		contentIndex,
+		content: "",
+		partial: output,
+	});
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -199,14 +188,17 @@ export function resetProfileArnCache(skipResolution = false): void {
   profileArnSkipResolution = skipResolution;
 }
 
-async function resolveProfileArn(accessToken: string, endpoint: string): Promise<string | undefined> {
+export async function resolveProfileArn(accessToken: string, endpoint: string): Promise<string | undefined> {
   if (profileArnSkipResolution) return undefined;
   const cached = profileArnCache.get(endpoint);
   if (cached !== undefined) return cached;
 
   try {
+    // Kiro CLI 2.5+ migrated profile resolution to the management endpoint.
+    // runtime.us-east-1.kiro.dev → management.us-east-1.kiro.dev
     const ep = new URL(endpoint);
-    ep.pathname = ep.pathname.replace(/\/generateAssistantResponse\/?$/, "/");
+    ep.hostname = ep.hostname.replace("runtime.", "management.");
+    ep.pathname = "/";
     ep.search = "";
     ep.hash = "";
 
@@ -249,12 +241,210 @@ interface KiroRequest {
   };
   profileArn?: string;
   agentMode?: string;
+  additionalModelRequestFields?: {
+    output_config?: { effort?: string };
+    thinking?: { type: "adaptive" | "disabled"; display?: "summarized" | "omitted" };
+    max_tokens?: number;
+  };
 }
 
 interface KiroToolCallState {
   toolUseId: string;
   name: string;
   input: string;
+}
+
+interface KiroToolUseSummary {
+  name: string;
+  toolUseId: string;
+  inputType: string;
+  inputKeys: string[];
+}
+
+interface KiroToolResultSummary {
+  toolUseId: string;
+  status: "success" | "error";
+  contentCount: number;
+  textChars: number;
+}
+
+interface KiroHistoryEntrySummary {
+  index: number;
+  role: "user" | "assistant" | "unknown";
+  contentChars: number;
+  imageCount?: number;
+  toolUses?: KiroToolUseSummary[];
+  toolResults?: KiroToolResultSummary[];
+}
+
+interface KiroToolSpecSummary {
+  name: string;
+  descriptionChars: number;
+  schemaKeys: string[];
+  propertyNames: string[];
+  requiredCount: number;
+}
+
+interface KiroRequestShapeSummary {
+  conversationId: string;
+  modelId?: string;
+  requestJsonChars: number;
+  historyLen: number;
+  roleSequence: string[];
+  history: KiroHistoryEntrySummary[];
+  current: {
+    contentChars: number;
+    imageCount: number;
+    toolResultCount: number;
+    toolSpecCount: number;
+    toolSpecNames: string[];
+    toolResults: KiroToolResultSummary[];
+    toolSpecs: KiroToolSpecSummary[];
+  };
+  toolIntegrity: {
+    toolUseIds: string[];
+    toolResultIds: string[];
+    duplicateToolUseIds: string[];
+    duplicateToolResultIds: string[];
+    unmatchedToolResults: string[];
+    toolUsesWithoutResults: string[];
+  };
+  additionalModelRequestFieldKeys: string[];
+  hasProfileArn: boolean;
+  agentMode?: string;
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+function duplicateValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) dupes.add(value);
+    else seen.add(value);
+  }
+  return [...dupes].sort();
+}
+
+function objectKeys(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>).sort();
+}
+
+function summarizeToolUse(toolUse: { name: string; toolUseId: string; input: Record<string, unknown> }): KiroToolUseSummary {
+  const input = toolUse.input;
+  return {
+    name: toolUse.name,
+    toolUseId: toolUse.toolUseId,
+    inputType: Array.isArray(input) ? "array" : typeof input,
+    inputKeys: objectKeys(input),
+  };
+}
+
+function summarizeToolResult(toolResult: KiroToolResult): KiroToolResultSummary {
+  return {
+    toolUseId: toolResult.toolUseId,
+    status: toolResult.status,
+    contentCount: toolResult.content.length,
+    textChars: toolResult.content.reduce((sum, part) => sum + part.text.length, 0),
+  };
+}
+
+function summarizeToolSpec(toolSpec: KiroToolSpec): KiroToolSpecSummary {
+  const spec = toolSpec.toolSpecification;
+  const schema = spec.inputSchema.json;
+  const properties = schema.properties as Record<string, unknown> | undefined;
+  const required = schema.required;
+  return {
+    name: spec.name,
+    descriptionChars: spec.description.length,
+    schemaKeys: objectKeys(schema),
+    propertyNames: properties && typeof properties === "object" && !Array.isArray(properties)
+      ? Object.keys(properties).sort()
+      : [],
+    requiredCount: Array.isArray(required) ? required.length : 0,
+  };
+}
+
+function summarizeHistoryEntry(entry: KiroHistoryEntry, index: number): KiroHistoryEntrySummary {
+  if (entry.userInputMessage) {
+    const toolResults = entry.userInputMessage.userInputMessageContext?.toolResults ?? [];
+    return {
+      index,
+      role: "user",
+      contentChars: entry.userInputMessage.content.length,
+      imageCount: entry.userInputMessage.images?.length ?? 0,
+      ...(toolResults.length > 0 ? { toolResults: toolResults.map(summarizeToolResult) } : {}),
+    };
+  }
+  if (entry.assistantResponseMessage) {
+    const toolUses = entry.assistantResponseMessage.toolUses ?? [];
+    return {
+      index,
+      role: "assistant",
+      contentChars: entry.assistantResponseMessage.content.length,
+      ...(toolUses.length > 0 ? { toolUses: toolUses.map(summarizeToolUse) } : {}),
+    };
+  }
+  return { index, role: "unknown", contentChars: 0 };
+}
+
+function collectToolIntegrity(history: KiroHistoryEntry[], currentToolResults: KiroToolResult[]) {
+  const toolUseIds: string[] = [];
+  const toolResultIds: string[] = currentToolResults.map((toolResult) => toolResult.toolUseId);
+
+  for (const entry of history) {
+    for (const toolUse of entry.assistantResponseMessage?.toolUses ?? []) {
+      toolUseIds.push(toolUse.toolUseId);
+    }
+    for (const toolResult of entry.userInputMessage?.userInputMessageContext?.toolResults ?? []) {
+      toolResultIds.push(toolResult.toolUseId);
+    }
+  }
+
+  const useSet = new Set(toolUseIds);
+  const resultSet = new Set(toolResultIds);
+  return {
+    toolUseIds: uniqueSorted(toolUseIds),
+    toolResultIds: uniqueSorted(toolResultIds),
+    duplicateToolUseIds: duplicateValues(toolUseIds),
+    duplicateToolResultIds: duplicateValues(toolResultIds),
+    unmatchedToolResults: uniqueSorted(toolResultIds.filter((id) => !useSet.has(id))),
+    toolUsesWithoutResults: uniqueSorted(toolUseIds.filter((id) => !resultSet.has(id))),
+  };
+}
+
+function summarizeKiroRequest(request: KiroRequest, requestBody: string): KiroRequestShapeSummary {
+  const current = request.conversationState.currentMessage.userInputMessage;
+  const history = request.conversationState.history ?? [];
+  const currentContext = current.userInputMessageContext;
+  const currentToolResults = currentContext?.toolResults ?? [];
+  const currentTools = currentContext?.tools ?? [];
+  const historySummary = history.map(summarizeHistoryEntry);
+
+  return {
+    conversationId: request.conversationState.conversationId,
+    modelId: current.modelId,
+    requestJsonChars: requestBody.length,
+    historyLen: history.length,
+    roleSequence: historySummary.map((entry) => entry.role),
+    history: historySummary,
+    current: {
+      contentChars: current.content.length,
+      imageCount: current.images?.length ?? 0,
+      toolResultCount: currentToolResults.length,
+      toolSpecCount: currentTools.length,
+      toolSpecNames: currentTools.map((toolSpec) => toolSpec.toolSpecification.name).sort(),
+      toolResults: currentToolResults.map(summarizeToolResult),
+      toolSpecs: currentTools.map(summarizeToolSpec),
+    },
+    toolIntegrity: collectToolIntegrity(history, currentToolResults),
+    additionalModelRequestFieldKeys: objectKeys(request.additionalModelRequestFields),
+    hasProfileArn: !!request.profileArn,
+    agentMode: request.agentMode,
+  };
 }
 
 function emitToolCall(
@@ -267,6 +457,9 @@ function emitToolCall(
   let args: Record<string, unknown>;
   try {
     args = JSON.parse(state.input) as Record<string, unknown>;
+    if (args && typeof args === "object" && "__tool_use_purpose" in args) {
+      delete args.__tool_use_purpose;
+    }
   } catch (e) {
     log.warn(
       `failed to parse tool input for "${state.name}" (${state.toolUseId}): ${e instanceof Error ? e.message : String(e)}`,
@@ -310,16 +503,14 @@ export function streamKiro(
       timestamp: Date.now(),
     };
 
-    // Live index of the currently-open redacted-thinking block, if any.
-    // Hoisted above the try/catch so the terminal error path can close it
-    // to prevent downstream UIs from hanging on an orphan live indicator.
-    let hiddenThinkingIndex: number | null = null;
-    // Countdown timer that emits the user-visible marker delta if the
-    // first real output event doesn't arrive within
-    // HIDDEN_REASONING_COUNTDOWN_MS of `thinking_start`. Hoisted alongside
-    // `hiddenThinkingIndex` so every exit path can cancel it.
-    let hiddenMarkerTimer: ReturnType<typeof setTimeout> | null = null;
-    let hiddenMarkerEmitted = false;
+    // Hidden-reasoning breadcrumb timer. Armed on `start` (for
+    // `reasoningHidden` models), cancelled as soon as any content or
+    // tool-call event arrives. If the timer fires before anything
+    // else, `emitHiddenReasoningLate` pushes a complete shim block
+    // in one flush. Hoisted above the try/catch so the terminal
+    // error path can cancel it, preventing a stray late shim from
+    // firing after the stream ended.
+    let hiddenShimTimer: ReturnType<typeof setTimeout> | null = null;
 
     try {
       const accessToken = options?.apiKey;
@@ -327,7 +518,7 @@ export function streamKiro(
         throw new Error("Kiro credentials not set. Run /login kiro.");
       }
 
-      const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
+      const endpoint = model.baseUrl || "https://runtime.us-east-1.kiro.dev";
       const profileArn = await resolveProfileArn(accessToken, endpoint);
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
@@ -369,6 +560,12 @@ export function streamKiro(
         }`;
       }
 
+      // Build envState from the host process (matches real Kiro CLI).
+      const envState: KiroEnvState = {
+        operatingSystem: resolveOS(),
+        currentWorkingDirectory: process.cwd(),
+      };
+
       const conversationId = options?.sessionId ?? crypto.randomUUID();
       let retryCount = 0;
 
@@ -381,6 +578,15 @@ export function streamKiro(
           systemPrepended,
           currentMsgStartIdx,
         } = buildHistory(normalized, kiroModelId, systemPrompt);
+
+        // Inject the synthetic system seed pair at the start of history.
+        // The real Kiro CLI always sends this as the first history entries.
+        const seedInstruction = SYSTEM_SEED_INSTRUCTION.replace("{{modelId}}", kiroModelId);
+        const seedPair: KiroHistoryEntry[] = [
+          { userInputMessage: { content: seedInstruction, origin: "KIRO_CLI" } },
+          { assistantResponseMessage: { content: SYSTEM_SEED_ACK } },
+        ];
+        history.unshift(...seedPair);
 
         const currentMessages = normalized.slice(currentMsgStartIdx);
         const firstMsg = currentMessages[0];
@@ -402,7 +608,7 @@ export function streamKiro(
                 const tc = b as ToolCall;
                 armToolUses.push({
                   name: tc.name,
-                  toolUseId: tc.id,
+                  toolUseId: toKiroToolUseId(tc.id),
                   input: parseToolArgs(tc.arguments),
                 });
               }
@@ -436,7 +642,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toKiroToolUseId(trm.toolCallId),
               });
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
@@ -446,7 +652,8 @@ export function streamKiro(
             }
           }
           if (toolResultImages.length > 0) {
-            const converted = convertImagesToKiro(toolResultImages);
+            const { images: converted, omitted } = convertImagesToKiro(toolResultImages);
+            if (omitted > 0) log.warn(`${omitted} tool-result image(s) omitted (size/count limit)`);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
           currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
@@ -458,7 +665,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toKiroToolUseId(trm.toolCallId),
               });
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
@@ -468,7 +675,8 @@ export function streamKiro(
             }
           }
           if (toolResultImages.length > 0) {
-            const converted = convertImagesToKiro(toolResultImages);
+            const { images: converted, omitted } = convertImagesToKiro(toolResultImages);
+            if (omitted > 0) log.warn(`${omitted} tool-result image(s) omitted (size/count limit)`);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
           currentContent = "Tool results provided.";
@@ -479,18 +687,83 @@ export function streamKiro(
           }
         }
 
-        let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
-        if (currentToolResults.length > 0 || (context.tools && context.tools.length > 0)) {
-          uimc = {};
-          if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
-          if (context.tools?.length) {
-            uimc.tools = convertToolsToKiro(context.tools);
-          }
+        // Wrap content in the Kiro CLI format: context entry + user message.
+        const now = new Date();
+        const tzOffset = -now.getTimezoneOffset();
+        const tzSign = tzOffset >= 0 ? "+" : "-";
+        const tzH = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, "0");
+        const tzM = String(Math.abs(tzOffset) % 60).padStart(2, "0");
+        const isoLocal = now.getFullYear() + "-" +
+          String(now.getMonth() + 1).padStart(2, "0") + "-" +
+          String(now.getDate()).padStart(2, "0") + "T" +
+          String(now.getHours()).padStart(2, "0") + ":" +
+          String(now.getMinutes()).padStart(2, "0") + ":" +
+          String(now.getSeconds()).padStart(2, "0") + "." +
+          String(now.getMilliseconds()).padStart(3, "0") +
+          tzSign + tzH + ":" + tzM;
+        const weekday = now.toLocaleDateString("en-US", { weekday: "long" });
+        currentContent =
+          `--- CONTEXT ENTRY BEGIN ---\n` +
+          `Current time: ${weekday}, ${isoLocal}\n` +
+          `--- CONTEXT ENTRY END ---\n\n` +
+          `--- USER MESSAGE BEGIN ---\n` +
+          `${currentContent}\n` +
+          `--- USER MESSAGE END ---`;
+
+        // Always include envState in userInputMessageContext (real client does).
+        let uimc: { envState: KiroEnvState; toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } = {
+          envState,
+        };
+        if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
+        if (context.tools?.length) {
+          // Bedrock / Amazon Q strict schema requirements:
+          // 1. No $schema
+          // 2. No empty required arrays
+          // Note: additionalProperties IS supported by Bedrock and MUST be
+          // preserved — it constrains the model to only use declared properties,
+          // preventing hallucinated fields and schema-mismatch errors on the host.
+          const deepCleanSchema = (obj: any): any => {
+            if (Array.isArray(obj)) {
+              return obj.map(deepCleanSchema);
+            } else if (obj !== null && typeof obj === "object") {
+              const cleaned: any = {};
+              for (const [k, v] of Object.entries(obj)) {
+                if (k === "$schema") continue;
+                if (k === "required" && Array.isArray(v) && v.length === 0) continue;
+                cleaned[k] = deepCleanSchema(v);
+              }
+              return cleaned;
+            }
+            return obj;
+          };
+
+          uimc.tools = context.tools.map((t) => {
+            const params = deepCleanSchema(t.parameters) as Record<string, any>;
+            // Bedrock / Amazon Q often expects __tool_use_purpose in properties.
+            // We'll inject it just in case it's a hard requirement, though it might not be.
+            if (params.properties) {
+              params.properties.__tool_use_purpose = {
+                type: "string",
+                description: "A brief explanation why you are making this tool use.",
+              };
+            }
+            return {
+              toolSpecification: {
+                name: t.name,
+                description: t.description || `Use ${t.name}`,
+                inputSchema: { json: params },
+              },
+            };
+          });
         }
 
         if (firstMsg?.role === "user") {
           const imgs = extractImages(firstMsg);
-          if (imgs.length > 0) currentImages = convertImagesToKiro(imgs);
+          if (imgs.length > 0) {
+            const { images: converted, omitted } = convertImagesToKiro(imgs);
+            if (omitted > 0) log.warn(`${omitted} user image(s) omitted (size/count limit)`);
+            currentImages = converted;
+          }
         }
 
         const request: KiroRequest = {
@@ -504,7 +777,7 @@ export function streamKiro(
                 modelId: kiroModelId,
                 origin: "KIRO_CLI",
                 ...(currentImages ? { images: currentImages } : {}),
-                ...(uimc ? { userInputMessageContext: uimc } : {}),
+                userInputMessageContext: uimc,
               },
             },
             ...(history.length > 0 ? { history } : {}),
@@ -513,30 +786,67 @@ export function streamKiro(
           agentMode: "vibe",
         };
 
+        // Attach adaptive thinking effort when the model supports it.
+        // Pi has 5 levels (minimal…xhigh), Kiro has 5 (low…max).
+        // Pi's extra bottom level (`minimal`) means each maps one up.
+        const EFFORT_MAP: Record<string, string> = {
+          minimal: "low",
+          low: "medium",
+          medium: "high",
+          high: "xhigh",
+          xhigh: "max",
+        };
+        const staticModel = kiroModels.find((m) => m.id === model.id) as KiroModel | undefined;
+        const dynamicModel = getCachedDynamicModels()?.find((m) => m.id === model.id);
+        const supportedEfforts = staticModel?.supportedEfforts ?? dynamicModel?.supportedEfforts;
+        const supportsThinkingConfig = staticModel?.supportsThinkingConfig ?? dynamicModel?.supportsThinkingConfig;
+        
+        if (supportedEfforts && supportedEfforts.length > 0 && options?.reasoning && typeof options.reasoning === "string") {
+          const kiroEffort = EFFORT_MAP[options.reasoning];
+          if (kiroEffort && supportedEfforts.includes(kiroEffort)) {
+            request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+            request.additionalModelRequestFields.output_config = { effort: kiroEffort };
+            log.debug("effort.set", { piReasoning: options.reasoning, kiroEffort, model: model.id });
+          }
+        }
+
+        // Request the adaptive thinking block so that Kiro streams the reasoning text.
+        if (supportsThinkingConfig && thinkingEnabled) {
+          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+          request.additionalModelRequestFields.thinking = {
+            type: "adaptive",
+            display: "summarized",
+          };
+          log.debug("thinking.set", { type: "adaptive", display: "summarized", model: model.id });
+        }
+
         // -- HTTP request with capacity-retry inner loop -----------------
-        // Emit `start` and the hidden-reasoning indicator *before* the
-        // fetch so the live indicator covers the server-side deliberation
-        // window (which is where the 25-30s wait actually happens on
-        // Claude 4.7 — the model reasons before sending any bytes).
+        // Emit `start` and arm the hidden-reasoning countdown. The
+        // shim is deferred: if content or a tool call arrives within
+        // HIDDEN_REASONING_COUNTDOWN_MS, the timer is cancelled and
+        // no shim is emitted. If nothing arrives in time, the timer
+        // fires a complete shim (start + delta + end) in one flush.
+        // This covers the 25-30s server-side deliberation window on
+        // Claude 4.7 without polluting fast responses with an empty
+        // thinking block.
         stream.push({ type: "start", partial: output });
-        if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
-          hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
-          hiddenMarkerEmitted = false;
-          const idx = hiddenThinkingIndex;
-          hiddenMarkerTimer = setTimeout(() => {
-            hiddenMarkerTimer = null;
-            if (hiddenThinkingIndex === idx && !hiddenMarkerEmitted) {
-              emitHiddenReasoningMarker(output, stream, idx);
-              hiddenMarkerEmitted = true;
-            }
+        if (reasoningHidden && thinkingEnabled && hiddenShimTimer === null) {
+          hiddenShimTimer = setTimeout(() => {
+            hiddenShimTimer = null;
+            emitHiddenReasoningLate(output, stream);
           }, HIDDEN_REASONING_COUNTDOWN_MS);
         }
 
         let response!: Response;
         let capacityRetryCount = 0;
+        let transientRetryCount = 0;
+        let contextTruncationAttempt = 0;
         while (true) {
           const mid = crypto.randomUUID().replace(/-/g, "");
           const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${mid}`;
+          const requestBody = JSON.stringify(request);
+          const requestShape = log.isDebug() ? summarizeKiroRequest(request, requestBody) : undefined;
+          if (requestShape) log.debug("request.shape", requestShape);
 
           log.debug("request.send", {
             attempt: retryCount,
@@ -545,6 +855,7 @@ export function streamKiro(
             currentContentLen: currentContent.length,
             hasImages: !!currentImages,
             toolResultCount: currentToolResults.length,
+            requestJsonChars: requestBody.length,
           });
 
           response = await fetch(endpoint, {
@@ -561,7 +872,7 @@ export function streamKiro(
               "x-amz-user-agent": ua,
               "user-agent": ua,
             },
-            body: JSON.stringify(request),
+            body: requestBody,
             signal: options?.signal,
           });
 
@@ -573,7 +884,11 @@ export function streamKiro(
           } catch {
             errText = "";
           }
-          log.debug("response.error", { status: response.status, body: errText });
+          log.debug("response.error", {
+            status: response.status,
+            body: errText,
+            ...(requestShape ? { requestShape } : {}),
+          });
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {
             capacityRetryCount++;
@@ -593,7 +908,45 @@ export function streamKiro(
             throw new Error(`Kiro API error: ${errText || response.statusText}`);
           }
           if (isTooBigError(response.status, errText)) {
+            if (contextTruncationAttempt < CONTEXT_TRUNCATION_MAX_RETRIES && history.length > 0) {
+              contextTruncationAttempt++;
+              const dropCount = Math.max(1, Math.floor(history.length * CONTEXT_TRUNCATION_DROP_RATIO));
+              const before = history.length;
+              history.splice(0, dropCount);
+              log.warn(
+                `context too large — truncated history from ${before} to ${history.length} entries ` +
+                `(attempt ${contextTruncationAttempt}/${CONTEXT_TRUNCATION_MAX_RETRIES})`,
+              );
+              // Rebuild request with truncated history and retry
+              request.conversationState.history = history.length > 0 ? history : undefined;
+              continue;
+            }
             throw new Error(`Kiro API error: context_length_exceeded (${response.status} ${errText})`);
+          }
+          if (isTransientError(response.status) && transientRetryCount < TRANSIENT_MAX_RETRIES) {
+            transientRetryCount++;
+            const jitter = Math.floor(Math.random() * 1000);
+            const delayMs = exponentialBackoff(
+              transientRetryCount - 1,
+              TRANSIENT_BASE_DELAY_MS,
+              TRANSIENT_MAX_DELAY_MS,
+            ) + jitter;
+            log.warn(
+              `transient error ${response.status} — retrying in ${delayMs}ms ` +
+              `(${transientRetryCount}/${TRANSIENT_MAX_RETRIES})`,
+            );
+            await abortableDelay(delayMs, options?.signal);
+            continue;
+          }
+          if (response.status === 401) {
+            const permanent = isPermanentError(errText);
+            if (permanent) {
+              profileArnCache.delete(endpoint);
+              throw new Error(
+                `Kiro API error: credentials permanently invalid — run /login kiro to re-authenticate. ${errText}`,
+              );
+            }
+            // Non-permanent 401 falls through to the generic throw below
           }
           if (response.status === 403) {
             // Access token was accepted earlier (profileArn resolved) but is
@@ -611,6 +964,12 @@ export function streamKiro(
         if (capacityRetryCount > 0) {
           log.info(`recovered from capacity pressure after ${capacityRetryCount} retries`);
         }
+        if (transientRetryCount > 0) {
+          log.info(`recovered from transient error after ${transientRetryCount} retries`);
+        }
+        if (contextTruncationAttempt > 0) {
+          log.info(`recovered after ${contextTruncationAttempt} context truncation(s)`);
+        }
 
         // -- Consume response stream -------------------------------------
         const reader = response.body?.getReader();
@@ -625,10 +984,14 @@ export function streamKiro(
         let chunkSeq = 0;
         let eventSeq = 0;
 
-        // ThinkingTagParser is disabled for reasoningHidden models since
-        // no `<thinking>` tags will ever appear in the stream.
-        const thinkingParser =
-          thinkingEnabled && !reasoningHidden ? new ThinkingTagParser(output, stream) : null;
+        // ThinkingTagParser runs unconditionally when thinking is
+        // enabled. Defensive against providers that intermittently
+        // leak `<thinking>...</thinking>` tags despite declaring
+        // `reasoningHidden` (Claude Opus 4.7's adaptive-thinking
+        // policy is advisory, not binding).
+        const thinkingParser = thinkingEnabled
+          ? new ThinkingTagParser(output, stream)
+          : null;
         let textBlockIndex: number | null = null;
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
@@ -639,31 +1002,17 @@ export function streamKiro(
           currentToolCall = null;
         };
 
-        /** Cancel the countdown timer without closing the block. */
-        const cancelHiddenMarkerTimer = () => {
-          if (hiddenMarkerTimer) {
-            clearTimeout(hiddenMarkerTimer);
-            hiddenMarkerTimer = null;
-          }
-        };
-
         /**
-         * Close the hidden-reasoning block before the first real
-         * content/tool event is emitted (happy path) or on stream end
-         * (defensive). Cancels the countdown timer, emits `thinking_end`
-         * with empty content, and sets `hiddenThinkingIndex = null` so
-         * subsequent events don't try to close an already-closed block.
-         *
-         * The accumulated `thinking` text (if the countdown fired) lives
-         * on `output.content[contentIndex].thinking` — downstream UIs
-         * either drop the block via an empty-text predicate (fast path)
-         * or via a known-placeholder predicate (slow path).
+         * Cancel the hidden-reasoning countdown timer. Called on the
+         * first content / tool-call event so the shim is suppressed
+         * when real output arrives in time. No-op once the timer
+         * has already fired (the shim is self-contained and complete
+         * by then, or was never armed for non-reasoningHidden models).
          */
-        const closeHiddenBreadcrumb = () => {
-          cancelHiddenMarkerTimer();
-          if (hiddenThinkingIndex !== null) {
-            closeHiddenReasoning(output, stream, hiddenThinkingIndex);
-            hiddenThinkingIndex = null;
+        const cancelHiddenShim = () => {
+          if (hiddenShimTimer) {
+            clearTimeout(hiddenShimTimer);
+            hiddenShimTimer = null;
           }
         };
 
@@ -730,7 +1079,13 @@ export function streamKiro(
           }
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
-          resetIdle();
+
+          // Only reset the idle timer when real events arrive — raw byte
+          // reads (keepalive framing, partial chunks) must NOT prevent the
+          // idle timeout from firing. Without this guard, the API's
+          // keepalive framing resets the timer on every chunk, causing
+          // potentially infinite stream hangs.
+          if (events.length > 0) resetIdle();
 
           if (log.isDebug() && events.length > 0) {
             for (const ev of events) {
@@ -742,18 +1097,44 @@ export function streamKiro(
             switch (event.type) {
               case "contextUsage": {
                 const pct = event.data.contextUsagePercentage;
-                output.usage.input = Math.round((pct / 100) * model.contextWindow);
+                // Force overflow detection when context nears capacity.
+                // Pi's isContextOverflow() triggers compaction when
+                // usage.input > contextWindow.
+                output.usage.input = pct >= COMPACTION_THRESHOLD_PCT
+                  ? model.contextWindow + 1
+                  : Math.round((pct / 100) * model.contextWindow);
                 receivedContextUsage = true;
+                log.debug("contextUsage", { pct, threshold: COMPACTION_THRESHOLD_PCT, willCompact: pct >= COMPACTION_THRESHOLD_PCT });
+                break;
+              }
+              case "reasoning": {
+                // Native reasoning event from Kiro (Opus 4.7+).
+                // Accumulate chunks into a single Pi thinking block.
+                cancelHiddenShim();
+                if (output.content.length === 0 || output.content[output.content.length - 1]?.type !== "thinking") {
+                  output.content.push({ type: "thinking", thinking: "" });
+                  stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+                }
+                const contentIndex = output.content.length - 1;
+                const tc = output.content[contentIndex] as ThinkingContent;
+                if (event.data.text) {
+                  tc.thinking += event.data.text;
+                  stream.push({ type: "thinking_delta", contentIndex, delta: event.data.text, partial: output });
+                }
+                if (event.data.signature) {
+                  tc.thinkingSignature = event.data.signature;
+                  // Signature indicates the end of the reasoning block.
+                  // Pi engine automatically handles the final state, but we could emit thinking_end here if needed.
+                }
                 break;
               }
               case "content": {
                 if (event.data === lastContentData) continue;
                 lastContentData = event.data;
                 totalContent += event.data;
-                // Close the live indicator before the first real text so
-                // the breadcrumb finalizes adjacent to — not overlapping —
-                // the text block.
-                closeHiddenBreadcrumb();
+                // Cancel the deferred shim — real content arrived in
+                // time, no breadcrumb needed.
+                cancelHiddenShim();
                 if (thinkingParser) {
                   thinkingParser.processChunk(event.data);
                 } else {
@@ -777,9 +1158,9 @@ export function streamKiro(
               }
               case "toolUse": {
                 const tc = event.data;
-                // Close the live indicator before any tool-call events so
-                // the breadcrumb finalizes above the tool execution.
-                closeHiddenBreadcrumb();
+                // Cancel the deferred shim — a tool call arrived in
+                // time, no breadcrumb needed.
+                cancelHiddenShim();
                 sawAnyToolCalls = true;
                 if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
                   flushToolCall();
@@ -824,13 +1205,13 @@ export function streamKiro(
             log.warn(
               `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
+            // Cancel the pending shim BEFORE the backoff delay so
+            // the timer can't fire mid-wait (exponential backoff
+            // compounds to multi-second delays, easily exceeding
+            // HIDDEN_REASONING_COUNTDOWN_MS). The retry re-arms a
+            // fresh timer on the next `start`.
+            cancelHiddenShim();
             await abortableDelay(delayMs, options?.signal);
-            // Close any open live indicator (cancels the countdown timer
-            // and emits thinking_end with empty content) so the retry can
-            // open a fresh block at contentIndex 0. pi-agent-core's
-            // indexed assignment overwrites the prior block on the new
-            // thinking_start, keeping consumer state in sync.
-            closeHiddenBreadcrumb();
             // Reset output content. Consumer-side `partial.content[contentIndex]`
             // (see pi-agent-core proxy.js) uses indexed assignment, so when the
             // retry re-emits `text_start` at contentIndex 0 it overwrites the
@@ -845,13 +1226,12 @@ export function streamKiro(
           );
         }
 
-        // Stream ended cleanly. If we saw any real output, close the
-        // block now. If not, defer until we know whether we'll retry so
-        // terminal-empty responses still close the block exactly once.
-        const gotAnyOutput = lastContentData !== "" || sawAnyToolCalls;
-        if (gotAnyOutput) {
-          closeHiddenBreadcrumb();
-        }
+        // Stream ended cleanly. Cancel the deferred shim — either
+        // content/tool calls already cancelled it, or nothing arrived
+        // and the timer may still be pending (below-threshold
+        // response). Either way, we don't want a late shim to fire
+        // after `done`.
+        cancelHiddenShim();
 
         if (currentToolCall && emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
         if (thinkingParser) {
@@ -890,19 +1270,18 @@ export function streamKiro(
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             log.warn(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
-            // Close the still-open block (gotAnyOutput was false above,
-            // so the block is still open here). Cancels the countdown
-            // timer and emits thinking_end with empty content.
-            closeHiddenBreadcrumb();
+            // Cancel the pending shim BEFORE the backoff delay so
+            // it can't fire mid-wait. Retry re-arms a fresh timer.
+            cancelHiddenShim();
             output.content = [];
             textBlockIndex = null;
             await abortableDelay(delayMs, options?.signal);
             continue;
           }
           log.warn(`empty response persisted after ${MAX_RETRIES} retries`);
-          // No retries left — close the block so downstream doesn't hang
-          // on an orphan open thinking_start.
-          closeHiddenBreadcrumb();
+          // No retries left — cancel any pending shim so it doesn't
+          // fire after the empty-response path returns.
+          cancelHiddenShim();
         }
 
         // Stop reason classification per doc/conformance.md §35–37:
@@ -933,19 +1312,13 @@ export function streamKiro(
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
-      // Close any still-open live-indicator block before the error event.
-      // Cancels the countdown timer (if still pending) so no stray
-      // thinking_delta fires after the stream ends, and emits
-      // thinking_end so downstream UIs don't hang on an orphan
-      // thinking_start. The block's accumulated text (if the countdown
-      // fired) stays on output.content[i].thinking for history/export.
-      if (hiddenMarkerTimer) {
-        clearTimeout(hiddenMarkerTimer);
-        hiddenMarkerTimer = null;
-      }
-      if (hiddenThinkingIndex !== null) {
-        closeHiddenReasoning(output, stream, hiddenThinkingIndex);
-        hiddenThinkingIndex = null;
+      // Cancel the pending shim timer so no stray shim fires after
+      // the error event. Nothing to close — the shim is self-
+      // contained when it fires, and if the timer is still armed
+      // here the shim simply never existed.
+      if (hiddenShimTimer) {
+        clearTimeout(hiddenShimTimer);
+        hiddenShimTimer = null;
       }
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
