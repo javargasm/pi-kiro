@@ -8,6 +8,7 @@ import { resolveProfileArn } from "./stream.js";
 
 /** Canonical Kiro API IDs (dot form) accepted by the server. */
 export const KIRO_MODEL_IDS = new Set<string>([
+  "claude-fable-5",
   "claude-opus-4.8",
   "claude-opus-4.7",
   "claude-opus-4.6",
@@ -90,6 +91,7 @@ export function resolveApiRegion(ssoRegion: string | undefined): string {
  */
 const MODELS_BY_REGION: Record<string, Set<string>> = {
   "us-east-1": new Set([
+    "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
@@ -113,6 +115,7 @@ const MODELS_BY_REGION: Record<string, Set<string>> = {
     "auto",
   ]),
   "eu-central-1": new Set([
+    "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
@@ -216,6 +219,17 @@ export interface KiroModel {
 }
 
 export const kiroModels: KiroModel[] = [
+  {
+    ...KIRO_DEFAULTS,
+    id: "claude-fable-5",
+    name: "Claude Fable 5",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    firstTokenTimeout: 180_000,
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+  },
   {
     ...KIRO_DEFAULTS,
     id: "claude-opus-4-8",
@@ -465,7 +479,7 @@ export async function fetchAvailableModels(
 
 /** Model families known to support reasoning/thinking. */
 const REASONING_FAMILIES = new Set([
-  "claude-sonnet", "claude-opus",
+  "claude-fable", "claude-sonnet", "claude-opus",
   "deepseek", "kimi", "glm", "qwen", "agi-nova", "minimax"
 ]);
 
@@ -478,7 +492,7 @@ function isReasoningModel(dotId: string): boolean {
 
 /** First-token timeout for slow models (Claude Opus can take 2-3 minutes). */
 function firstTokenTimeout(dotId: string): number {
-  if (dotId.startsWith("claude-opus")) return 180_000;
+  if (dotId.startsWith("claude-fable") || dotId.startsWith("claude-opus")) return 180_000;
   return 90_000;
 }
 
