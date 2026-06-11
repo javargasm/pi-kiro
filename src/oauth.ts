@@ -232,7 +232,7 @@ export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCre
     options: [
       { id: "builder-id", label: "AWS Builder ID (personal account)" },
       { id: "idc",        label: "IAM Identity Center (enterprise SSO)" },
-      { id: "sync",       label: "Import from Kiro IDE (auto-sync local DB)" },
+      { id: "sync",       label: "Import from Kiro CLI/IDE (auto-sync local DB)" },
       { id: "desktop",    label: "Desktop refresh token (manual)" },
     ],
   });

@@ -113,13 +113,18 @@ function safeJsonParse(value: unknown): any {
 }
 
 /**
- * Recursively search a nested object for clientId + clientSecret.
- * Kiro's device-registration blob nests these at varying depths.
+ * Recursively search a nested object for the OIDC clientId + clientSecret.
+ * kiro-cli writes these as `client_id` / `client_secret` (snake_case) in
+ * its device-registration blob; some legacy codewhisperer / Kiro IDE
+ * blobs use camelCase (`clientId` / `clientSecret`). Accept either
+ * casing, nested at any depth.
  */
 function findClientCreds(obj: any): { clientId?: string; clientSecret?: string } {
   if (!obj || typeof obj !== "object") return {};
-  if (typeof obj.clientId === "string" && typeof obj.clientSecret === "string") {
-    return { clientId: obj.clientId, clientSecret: obj.clientSecret };
+  const id = obj.clientId ?? obj.client_id;
+  const secret = obj.clientSecret ?? obj.client_secret;
+  if (typeof id === "string" && typeof secret === "string") {
+    return { clientId: id, clientSecret: secret };
   }
   for (const key of Object.keys(obj)) {
     const result = findClientCreds(obj[key]);
