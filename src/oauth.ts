@@ -315,19 +315,13 @@ async function loginCliSync(callbacks: OAuthLoginCallbacks): Promise<KiroCredent
     log.warn(`Failed to fetch models after CLI sync: ${err}`);
   }
 
-  const refreshPacked = imported.clientId
-    ? `${imported.refreshToken}|${imported.clientId}|${imported.clientSecret ?? ""}|${imported.authMethod}`
-    : `${imported.refreshToken}|||desktop`;
-
-  return {
-    refresh: refreshPacked,
-    access: imported.accessToken,
-    expires: Date.now() + 3600 * 1000 - EXPIRES_BUFFER_MS,
-    clientId: imported.clientId ?? "",
-    clientSecret: imported.clientSecret ?? "",
-    region: imported.region,
-    authMethod: imported.authMethod,
-  };
+  // Route through kiroCredsFromCliImport so the struct `authMethod` is
+  // aligned with the refresh endpoint we can actually hit. The SSO cache
+  // fallback has no OIDC clientId/secret, so authMethod is forced to
+  // "desktop" there and the pack ends in "|||desktop" — keeping both
+  // consistent prevents the next refresh from failing the
+  // "missing clientId/clientSecret" precheck.
+  return kiroCredsFromCliImport(imported);
 }
 
 /**
@@ -457,11 +451,21 @@ async function syncBackToKiroCli(result: KiroCredentials): Promise<void> {
 /**
  * Build KiroCredentials from a KiroCliCredentials import.
  * Used by the fallback layers of the refresh cascade.
+ *
+ * `authMethod` is derived from what's actually refreshable: the OIDC path
+ * needs clientId+clientSecret, and the only viable refresh path without
+ * them is the desktop endpoint. When clientId is missing, the struct
+ * `authMethod` is forced to `"desktop"` so the next refresh hits the
+ * correct endpoint instead of failing the "missing clientId/clientSecret"
+ * precheck in `refreshTokenInner`.
  */
 function kiroCredsFromCliImport(imported: KiroCliCredentials): KiroCredentials {
+  const hasOidcCreds = !!imported.clientId && !!imported.clientSecret;
   const authMethod: "builder-id" | "idc" | "desktop" =
-    imported.authMethod === "idc" ? "idc" : "desktop";
-  const refreshPacked = imported.clientId
+    hasOidcCreds && imported.authMethod === "idc"
+      ? "idc"
+      : "desktop";
+  const refreshPacked = hasOidcCreds
     ? `${imported.refreshToken}|${imported.clientId}|${imported.clientSecret ?? ""}|${authMethod}`
     : `${imported.refreshToken}|||desktop`;
 

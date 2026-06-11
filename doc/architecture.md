@@ -36,10 +36,15 @@ indistinguishable from the real Kiro CLI and to smooth the login UX:
   real request captures, injected verbatim so the request is structurally
   identical to the official client. MCP tools (codegraph, pencil) are
   intentionally omitted because pi handles those directly.
-- **`kiro-cli-sync.ts`** — optional zero-friction login. If Kiro IDE is
-  installed and logged in, this reads its local SQLite credential DB
-  (readonly) and adapts the tokens into `KiroCredentials`, and can write
-  refreshed tokens back for bidirectional sync.
+- **`kiro-cli-sync.ts`** — optional zero-friction login. Primary read is
+  the kiro-cli SQLite DB at `data.sqlite3` in the platform's standard
+  data directory; that gives us the OIDC clientId/secret for proper OIDC
+  refresh. Fallback when the DB is missing/locked/unreadable is the AWS
+  SSO OIDC cache JSON at `~/.aws/sso/cache/kiro-auth-token.json` (the
+  file Kiro IDE writes); that has tokens + region but no OIDC creds, so
+  the resulting credential uses the desktop refresh endpoint. The module
+  also writes refreshed tokens back to the kiro-cli DB for
+  bidirectional sync.
 - **`health.ts`** — classifies error strings as permanent (expired/revoked
   grants → surface a re-login error) vs transient (let the retry loop run).
 
@@ -55,7 +60,11 @@ pi-kiro/
 │   ├── oauth.ts            (1) Auth. Device-code login + token refresh
 │   │                       (Builder ID + IAM Identity Center).
 │   ├── kiro-cli-sync.ts    (1) Optional zero-friction login: imports
-│   │                       credentials from Kiro IDE's local SQLite DB.
+│   │                       credentials from the kiro-cli SQLite DB at
+│   │                       `data.sqlite3` in the platform data dir,
+│   │                       falls back to the AWS SSO OIDC cache JSON
+│   │                       (~/.aws/sso/cache/kiro-auth-token.json) that
+│   │                       Kiro IDE writes when the DB is unavailable.
 │   ├── models.ts           Model catalog, SSO→API region map, dynamic
 │   │                       model fetch + cache, runtime-url resolver.
 │   ├── kiro-defaults.ts    Kiro CLI identity constants (system seed,

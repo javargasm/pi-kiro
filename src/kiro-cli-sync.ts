@@ -1,15 +1,39 @@
-// Kiro CLI credential sync — import tokens from Kiro IDE's local SQLite DB.
+// Kiro CLI credential sync — import tokens from local Kiro storage.
 //
-// Kiro IDE stores auth credentials in ~/.kiro/db/kiro.db (macOS/Linux) or
-// %APPDATA%\kiro\db\kiro.db (Windows). This module reads that DB in readonly
-// mode and returns parsed credentials compatible with our KiroCredentials type.
+// Kiro has two products that store credentials locally, and they use
+// different formats:
 //
-// This enables zero-friction login: if the user already has Kiro IDE installed
-// and logged in, pi-kiro can import the credentials without device-code flow.
+//   1. kiro-cli (Rust CLI). Credentials live in a SQLite database at
+//      `data.sqlite3` in the platform's standard data directory:
+//        - macOS:   ~/Library/Application Support/kiro-cli/data.sqlite3
+//        - Linux:   $XDG_DATA_HOME/kiro-cli/data.sqlite3
+//                   (or ~/.local/share/kiro-cli/data.sqlite3)
+//        - Windows: %APPDATA%/kiro-cli/data.sqlite3
+//      The `auth_kv` table holds token rows (keys: `kirocli:odic:token`,
+//      `kirocli:social:token`, etc.) and the device-registration row with
+//      OIDC clientId/clientSecret. The `state` table holds the active
+//      profile ARN under `api.codewhisperer.profile`.
+//
+//   2. Kiro IDE (VSCode-based GUI). The IDE does NOT use SQLite for
+//      auth tokens; it writes the standard AWS SSO OIDC cache JSON to
+//      `~/.aws/sso/cache/kiro-auth-token.json` on successful SSO login.
+//      This file holds bearer + refresh tokens, expiry, region, and
+//      `authMethod: "IdC"`, but NOT the OIDC clientId/secret — those
+//      live only in the kiro-cli SQLite DB.
+//
+// This module reads from the kiro-cli SQLite DB first (preferred: gives
+// full OIDC creds), then falls back to the Kiro IDE SSO cache JSON
+// (weaker: no OIDC creds, refresh must go through the desktop endpoint).
+// Both paths are readonly on import. The module also writes refreshed
+// tokens back to the kiro-cli SQLite DB for bidirectional sync.
+//
+// This enables zero-friction login: if the user has kiro-cli or Kiro
+// IDE installed and logged in, pi-kiro can import the credentials
+// without the device-code flow.
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { log } from "./debug";
 
 export interface KiroCliCredentials {
@@ -23,18 +47,59 @@ export interface KiroCliCredentials {
   email?: string;
 }
 
-/** Platform-specific path to Kiro IDE's SQLite database. */
+/**
+ * Platform-specific path to kiro-cli's SQLite credential database
+ * (`data.sqlite3`). The Kiro IDE (GUI) does not use SQLite for auth
+ * tokens — it writes the AWS SSO cache JSON instead (see
+ * `getKiroSsoCachePath` below). Only kiro-cli (the Rust CLI) stores
+ * credentials in a SQLite DB at these locations, confirmed in
+ * kirodotdev/Kiro#4847 and the kiro-cli source.
+ */
 function getKiroDbPath(): string {
   const home = homedir();
+
+  if (process.platform === "darwin") {
+    return join(home, "Library", "Application Support", "kiro-cli", "data.sqlite3");
+  }
+
   if (process.platform === "win32") {
     return join(
       process.env.APPDATA || join(home, "AppData", "Roaming"),
-      "kiro",
-      "db",
-      "kiro.db",
+      "kiro-cli",
+      "data.sqlite3",
     );
   }
-  return join(home, ".kiro", "db", "kiro.db");
+
+  // Linux and other Unix-likes: honor XDG_DATA_HOME per the XDG Base
+  // Directory spec; fall back to ~/.local/share which is kiro-cli's
+  // default when XDG_DATA_HOME is unset.
+  const xdgData = process.env.XDG_DATA_HOME;
+  if (xdgData && xdgData.length > 0) {
+    return join(xdgData, "kiro-cli", "data.sqlite3");
+  }
+  return join(home, ".local", "share", "kiro-cli", "data.sqlite3");
+}
+
+/**
+ * Platform-specific path to Kiro IDE's AWS SSO OIDC cache JSON file.
+ * Kiro IDE (the GUI) does not use SQLite for auth tokens; it writes
+ * the standard AWS SSO OIDC cache JSON to this path on successful SSO
+ * login. Per the AWS SSO OIDC client spec the file lives at
+ * `~/.aws/sso/cache/kiro-auth-token.json` on macOS/Linux and
+ * `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json` on Windows.
+ */
+function getKiroSsoCachePath(): string {
+  const home = homedir();
+  if (process.platform === "win32") {
+    return join(
+      process.env.USERPROFILE || home,
+      ".aws",
+      "sso",
+      "cache",
+      "kiro-auth-token.json",
+    );
+  }
+  return join(home, ".aws", "sso", "cache", "kiro-auth-token.json");
 }
 
 /** Safely parse JSON, returning null on failure. */
@@ -85,7 +150,7 @@ function extractRegionFromArn(arn: string | undefined): string | undefined {
  *
  * This function never throws — all errors are caught and logged.
  */
-export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
+async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
   const dbPath = getKiroDbPath();
   if (!existsSync(dbPath)) {
     log.debug(`Kiro CLI DB not found at ${dbPath}`);
@@ -160,7 +225,15 @@ export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
       const refreshToken = data.refreshToken || data.refresh_token;
       if (!accessToken && !refreshToken) continue;
 
-      const isIdc = row.key.includes("oidc") || row.key.includes("idc");
+      // kiro-cli uses the literal substring "odic" in its key names
+      // (e.g. `kirocli:odic:token`, `kirocli:odic:device-registration`).
+      // Some legacy codewhisperer / Kiro IDE blobs use "oidc" (with an
+      // extra 'o') or "idc" — accept all three to avoid defaulting
+      // real IdC tokens to `desktop`.
+      const isIdc =
+        row.key.includes("odic") ||
+        row.key.includes("oidc") ||
+        row.key.includes("idc");
       const authMethod: "idc" | "desktop" = isIdc ? "idc" : "desktop";
 
       const oidcRegion = data.region || "us-east-1";
@@ -202,6 +275,109 @@ export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
     log.warn(`Failed to import from Kiro CLI: ${err}`);
     return null;
   }
+}
+
+/** Subset of the AWS SSO OIDC cache entry shape that Kiro IDE writes. */
+interface KiroSsoCacheToken {
+  accessToken?: unknown;
+  refreshToken?: unknown;
+  expiresAt?: unknown;
+  clientIdHash?: unknown;
+  authMethod?: unknown;
+  provider?: unknown;
+  region?: unknown;
+}
+
+/**
+ * Map the SSO cache's `authMethod` string to our internal KiroCliCredentials
+ * shape. Kiro IDE writes `"IdC"` for IAM Identity Center logins. The cache
+ * does not record Builder ID — the AWS Builder ID path uses the standard
+ * `getCachedToken` and is not present in this file. Unknown / missing
+ * values default to `"idc"` because that's the only string observed in
+ * the wild.
+ */
+function mapSsoCacheAuthMethod(value: unknown): "idc" | "desktop" {
+  if (typeof value !== "string") return "idc";
+  const v = value.toLowerCase();
+  if (v === "builderid" || v === "builder-id") return "desktop";
+  return "idc";
+}
+
+/**
+ * Import credentials from Kiro IDE's AWS SSO OIDC cache file.
+ *
+ * Path: `~/.aws/sso/cache/kiro-auth-token.json` (per the AWS SSO OIDC
+ * client spec; AWS CLI and Kiro IDE both write here on successful SSO login).
+ *
+ * The file contains the bearer access token, refresh token, expiry, region,
+ * and the SSO auth method ("IdC", etc.). It does NOT contain the OIDC
+ * clientId/clientSecret — those are stored in Kiro IDE's SQLite DB.
+ *
+ * This is a fallback for when the SQLite read fails (locked, missing,
+ * unreadable) or yields no tokens. Without OIDC client creds, refresh must
+ * go through the desktop endpoint; we set `authMethod: "desktop"` for that
+ * path. The original SSO identity (IdC) is preserved by leaving
+ * `region` and the token values intact.
+ *
+ * Returns null if the file doesn't exist, is unreadable, isn't valid JSON,
+ * or has no token fields. Never throws.
+ */
+export async function importFromKiroSsoCache(): Promise<KiroCliCredentials | null> {
+  const path = getKiroSsoCachePath();
+  if (!existsSync(path)) {
+    log.debug(`Kiro SSO cache not found at ${path}`);
+    return null;
+  }
+
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (err) {
+    log.warn(`Failed to read Kiro SSO cache at ${path}: ${err}`);
+    return null;
+  }
+
+  const token = safeJsonParse(raw) as KiroSsoCacheToken | null;
+  if (!token || typeof token !== "object") {
+    log.debug(`Kiro SSO cache at ${path} is not valid JSON`);
+    return null;
+  }
+
+  const accessToken = typeof token.accessToken === "string" ? token.accessToken : "";
+  const refreshToken = typeof token.refreshToken === "string" ? token.refreshToken : "";
+  if (!accessToken && !refreshToken) {
+    log.debug(`Kiro SSO cache at ${path} has no tokens`);
+    return null;
+  }
+
+  const region =
+    typeof token.region === "string" && token.region.length > 0 ? token.region : "us-east-1";
+  const authMethod = mapSsoCacheAuthMethod(token.authMethod);
+
+  log.info(
+    `Imported Kiro SSO cache credentials (method=${authMethod}, region=${region})`,
+  );
+
+  return {
+    accessToken,
+    refreshToken,
+    region,
+    authMethod,
+  };
+}
+
+/**
+ * Top-level import: try the Kiro IDE SQLite DB first, then fall back to
+ * the AWS SSO cache JSON. The cache is a strictly weaker source (no
+ * OIDC clientId/clientSecret) so the SQLite read is preferred.
+ *
+ * Returns null only when neither path yields valid credentials.
+ * Never throws.
+ */
+export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
+  const dbResult = await importFromKiroDb();
+  if (dbResult) return dbResult;
+  return importFromKiroSsoCache();
 }
 
 /**

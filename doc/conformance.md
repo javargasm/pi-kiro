@@ -134,3 +134,25 @@ item numbers in comments.
 49. Expiry buffer: 5 min subtracted from returned `expiresIn`.
 50. Refresh packs pipe-format:
     `{refreshToken}|{clientId}|{clientSecret}|idc`.
+51. Kiro import reads from the kiro-cli SQLite DB at `data.sqlite3` in
+    the platform's standard data directory:
+    - macOS: `~/Library/Application Support/kiro-cli/data.sqlite3`
+    - Linux: `$XDG_DATA_HOME/kiro-cli/data.sqlite3` (default
+      `~/.local/share/kiro-cli/data.sqlite3`)
+    - Windows: `%APPDATA%/kiro-cli/data.sqlite3`
+    Schema: `auth_kv` table holds token rows (keys
+    `kirocli:odic:token`, `kirocli:social:token`, etc.) and a
+    device-registration row with OIDC clientId/clientSecret. The
+    `state` table holds the active profile ARN under
+    `api.codewhisperer.profile`. IdC detection matches key substrings
+    `"odic"`, `"oidc"`, or `"idc"`. Falls back to the AWS SSO OIDC
+    cache file at `~/.aws/sso/cache/kiro-auth-token.json` (or
+    `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json` on Windows)
+    when the kiro-cli DB is missing/locked/unreadable. The cache is
+    written by Kiro IDE (the GUI), not kiro-cli, and contains
+    `{accessToken, refreshToken, expiresAt, clientIdHash, authMethod,
+    provider, region}`. `authMethod: "IdC"` maps to internal `"idc"`,
+    missing/empty `region` defaults to `"us-east-1"`. Because the cache
+    has no OIDC clientId/clientSecret, refresh is routed through the
+    desktop endpoint (`authMethod: "desktop"`). The fallback is
+    automatic; the user sees no separate prompt.

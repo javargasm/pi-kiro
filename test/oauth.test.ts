@@ -1,6 +1,21 @@
 import type { OAuthAuthInfo, OAuthLoginCallbacks, OAuthPrompt, OAuthSelectPrompt } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `existsSync` is non-configurable in native ESM, so we mock `node:fs` at
+// the top level. The cascade tests in `refreshKiroToken` rely on the Kiro
+// IDE credential fallback paths (SQLite DB + AWS SSO cache) returning null;
+// the latter would otherwise pick up the developer's real SSO cache file.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: vi.fn().mockReturnValue(false),
+    readFileSync: vi.fn().mockReturnValue(""),
+  };
+});
+
 import { loginKiro, refreshKiroToken } from "../src/oauth";
+import { existsSync, readFileSync } from "node:fs";
 
 type FetchMock = ReturnType<typeof vi.fn>;
 
@@ -368,6 +383,109 @@ describe("refreshKiroToken", () => {
     expect(refreshed.access).toBe("AT2");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("loginCliSync falls back to SSO cache when SQLite DB is absent, returns aligned desktop credentials", async () => {
+    // Repro of the user-reported flow: ~/.kiro/db missing, but
+    // ~/.aws/sso/cache/kiro-auth-token.json present with IdC tokens and
+    // no OIDC clientId. loginCliSync must NOT throw "Make sure Kiro IDE
+    // is installed", and the returned credential must have aligned
+    // struct/pack authMethod so the next refresh hits the desktop
+    // endpoint.
+    const { existsSync, readFileSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const { join } = await import("node:path");
+    const cachePath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json");
+
+    vi.mocked(existsSync).mockImplementation((p) => p === cachePath);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({
+        accessToken: "AT",
+        refreshToken: "RT",
+        authMethod: "IdC",
+        region: "eu-central-1",
+      }),
+    );
+
+    // loginCliSync also calls fetchAvailableModels after import; stub it.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ models: [] }),
+    } as any);
+
+    const callbacks = makeCallbacks("sync");
+    const creds = await loginKiro(callbacks);
+
+    // Struct fields
+    expect(creds.access).toBe("AT");
+    expect(creds.region).toBe("eu-central-1");
+    expect(creds.authMethod).toBe("desktop"); // forced — no OIDC creds
+    expect(creds.clientId).toBe("");
+    expect(creds.clientSecret).toBe("");
+
+    // Pack suffix must match the struct authMethod (no mismatch that
+    // would fail the "missing clientId/clientSecret" precheck on refresh).
+    const packAuth = creds.refresh.split("|")[3];
+    expect(packAuth).toBe("desktop");
+  });
+
+  it("loginCliSync throws the documented error only when BOTH DB and SSO cache are absent", async () => {
+    // Neither file present — this is the only path that should still
+    // surface the existing "Make sure Kiro IDE is installed" message.
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.mocked(readFileSync).mockReturnValue("");
+    const callbacks = makeCallbacks("sync");
+    await expect(loginKiro(callbacks)).rejects.toThrow(
+      /Make sure Kiro IDE is installed/,
+    );
+  });
+
+  it("SSO cache import (no OIDC clientId) is refreshable via the desktop endpoint", async () => {
+    // The AWS SSO cache file at ~/.aws/sso/cache/kiro-auth-token.json
+    // provides the bearer + refresh tokens but no OIDC clientId/secret.
+    // kiroCredsFromCliImport must produce a credential whose struct
+    // `authMethod` is "desktop" so the next refresh hits the desktop
+    // endpoint instead of failing the OIDC precheck.
+    const { importFromKiroSsoCache } = await import("../src/kiro-cli-sync");
+    const { readFileSync, existsSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const { join } = await import("node:path");
+    const cachePath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json");
+
+    vi.mocked(existsSync).mockImplementation((p) => p === cachePath);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({
+        accessToken: "AT",
+        refreshToken: "RT",
+        authMethod: "IdC",
+        region: "eu-central-1",
+      }),
+    );
+
+    const imported = await importFromKiroSsoCache();
+    expect(imported).not.toBeNull();
+
+    // Now exercise the refresh path: import succeeded but the struct
+    // `authMethod` must be "desktop" so refreshTokenInner uses the
+    // desktop endpoint, not the OIDC one (which would fail with
+    // "missing clientId/clientSecret").
+    fetchMock.mockResolvedValueOnce(
+      okJson({ accessToken: "AT2", refreshToken: "RT2", expiresIn: 3600 }),
+    );
+    const refreshed = await refreshKiroToken({
+      refresh: `RT|||desktop`,
+      access: "AT",
+      expires: 0,
+      region: "eu-central-1",
+      authMethod: "desktop",
+      clientId: "",
+      clientSecret: "",
+    });
+    expect(refreshed.access).toBe("AT2");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://prod.eu-central-1.auth.desktop.kiro.dev/refreshToken",
       expect.objectContaining({ method: "POST" }),
     );
   });
