@@ -152,8 +152,11 @@ describe("streamKiro", () => {
     expect(opts.headers["X-Amz-Target"]).toBe(
       "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
     );
-    expect(opts.headers["x-amzn-kiro-agent-mode"]).toBe("vibe");
     expect(opts.headers["Content-Type"]).toBe("application/x-amz-json-1.0");
+    expect(opts.headers.Accept).toBe("*/*");
+    expect(opts.headers["amz-sdk-request"]).toBe("attempt=1; max=3");
+    expect(opts.headers.Pragma).toBe("no-cache");
+    expect(opts.headers["Cache-Control"]).toBe("no-cache");
   });
 
   it("logs safe request.shape diagnostics for tool-use format errors", async () => {

@@ -38,3 +38,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .codegraph/
 # Local agent/harness plans (not part of the published package)
 docs/superpowers/
+# Private local-only notes (deployment runbook, etc.)
+docs/private/
+
+# Pix Agent
+.ai/
+.pi-lens/

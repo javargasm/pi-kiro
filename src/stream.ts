@@ -842,8 +842,9 @@ export function streamKiro(
         let transientRetryCount = 0;
         let contextTruncationAttempt = 0;
         while (true) {
-          const mid = crypto.randomUUID().replace(/-/g, "");
-          const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${mid}`;
+          const osName = resolveOS();
+          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 md/appVersion-2.7.1 app/AmazonQ-For-CLI`;
+          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
           const requestShape = log.isDebug() ? summarizeKiroRequest(request, requestBody) : undefined;
           if (requestShape) log.debug("request.shape", requestShape);
@@ -862,15 +863,17 @@ export function streamKiro(
             method: "POST",
             headers: {
               "Content-Type": "application/x-amz-json-1.0",
-              Accept: "application/json",
+              Accept: "*/*",
+              "Accept-Encoding": "gzip",
               Authorization: `Bearer ${accessToken}`,
               "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
               "x-amzn-codewhisperer-optout": "true",
               "amz-sdk-invocation-id": crypto.randomUUID(),
-              "amz-sdk-request": "attempt=1; max=1",
-              "x-amzn-kiro-agent-mode": "vibe",
-              "x-amz-user-agent": ua,
+              "amz-sdk-request": "attempt=1; max=3",
               "user-agent": ua,
+              "x-amz-user-agent": xAmzUa,
+              Pragma: "no-cache",
+              "Cache-Control": "no-cache",
             },
             body: requestBody,
             signal: options?.signal,
