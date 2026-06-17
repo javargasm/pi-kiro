@@ -10,12 +10,11 @@ import type {
   Message,
   TextContent,
   ThinkingContent,
-  Tool,
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { createHash } from "node:crypto";
-import { TOOL_PURPOSE_FIELD } from "./kiro-defaults.ts";
+
 
 /** Drop assistant messages that ended in error/aborted — partial turns
  *  shouldn't be replayed. */
@@ -146,28 +145,6 @@ export function toKiroToolUseId(id: string): string {
   if (KIRO_TOOL_USE_ID_RE.test(id)) return id;
   const digest = createHash("sha256").update(id).digest("hex").slice(0, 22);
   return `tooluse_${digest}`;
-}
-
-export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
-  return tools.map((tool) => {
-    const schema = tool.parameters as Record<string, unknown>;
-    const props = (schema.properties ?? {}) as Record<string, unknown>;
-    return {
-      toolSpecification: {
-        name: tool.name,
-        description: tool.description,
-        inputSchema: {
-          json: {
-            ...schema,
-            properties: {
-              ...props,
-              __tool_use_purpose: TOOL_PURPOSE_FIELD,
-            },
-          },
-        },
-      },
-    };
-  });
 }
 
 /**

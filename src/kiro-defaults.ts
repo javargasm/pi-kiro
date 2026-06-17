@@ -19,7 +19,7 @@ export const SYSTEM_SEED_ACK =
 
 /**
  * Every tool schema in the real Kiro CLI includes this extra property.
- * Injected by `convertToolsToKiro()` into each tool's input schema.
+ * Injected into each tool's input schema when building the request.
  */
 export const TOOL_PURPOSE_FIELD = {
   type: "string",

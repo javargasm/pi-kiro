@@ -120,7 +120,16 @@ function toProviderModels(defs: readonly KiroModelDef[]): ProviderModelConfig[] 
 }
 
 /** Read kiro credentials from pi's auth.json if available. */
-function readKiroCredentials(): { access: string; region: string; profileArn?: string } | null {
+function readKiroCredentials(): {
+  access: string;
+  refresh: string;
+  expires: number;
+  region: string;
+  profileArn?: string;
+  clientId?: string;
+  clientSecret?: string;
+  authMethod?: string;
+} | null {
   try {
     const authPath = join(homedir(), ".pi", "agent", "auth.json");
     if (!existsSync(authPath)) return null;
@@ -148,12 +157,42 @@ function readKiroCredentials(): { access: string; region: string; profileArn?: s
     const profileArn = [kiro.profileArn, metadata?.profileArn].find((v): v is string => typeof v === "string");
 
     return {
-      access: kiro.access,
+      access: kiro.access as string,
+      refresh: typeof kiro.refresh === "string" ? kiro.refresh : "",
+      expires: typeof kiro.expires === "number" ? kiro.expires : 0,
       region: (kiro.region as string) || "us-east-1",
       profileArn,
+      clientId: typeof kiro.clientId === "string" ? kiro.clientId : undefined,
+      clientSecret: typeof kiro.clientSecret === "string" ? kiro.clientSecret : undefined,
+      authMethod: typeof kiro.authMethod === "string" ? kiro.authMethod : undefined,
     };
   } catch {
     return null;
+  }
+}
+
+/** Persist refreshed credentials to pi's auth.json so pi picks them up. */
+function writeKiroCredentials(refreshed: KiroCredentials): void {
+  try {
+    const authPath = join(homedir(), ".pi", "agent", "auth.json");
+    const raw = existsSync(authPath) ? readFileSync(authPath, "utf-8") : "{}";
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    const existing = (data["kiro"] as Record<string, unknown> | undefined) ?? {};
+    data["kiro"] = {
+      ...existing,
+      type: "oauth",
+      access: refreshed.access,
+      refresh: refreshed.refresh,
+      expires: refreshed.expires,
+      clientId: refreshed.clientId,
+      clientSecret: refreshed.clientSecret,
+      region: refreshed.region,
+      authMethod: refreshed.authMethod,
+      profileArn: refreshed.profileArn,
+    };
+    writeFileSync(authPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  } catch (err) {
+    log.warn(`Failed to persist refreshed credentials: ${err}`);
   }
 }
 
@@ -164,11 +203,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   let modelDefs = toProviderModels(kiroModels);
   const creds = readKiroCredentials();
   if (creds?.profileArn) {
+    let accessToken = creds.access;
+
+    // Always refresh at startup to guarantee a valid token for model fetch
+    if (creds.refresh) {
+      try {
+        log.info("Refreshing token at startup…");
+        const refreshed = await refreshKiroToken(creds);
+        accessToken = refreshed.access;
+        writeKiroCredentials(refreshed);
+      } catch (err) {
+        log.warn(`Startup token refresh failed, trying with existing token: ${err}`);
+      }
+    }
+
     try {
       const apiRegion = resolveApiRegion(creds.region);
-      const runtimeUrl = resolveRuntimeUrl(apiRegion);
-      seedProfileArn(runtimeUrl + "/", creds.profileArn);
-      const apiModels = await fetchAvailableModels(creds.access, apiRegion, creds.profileArn);
+      seedProfileArn(creds.profileArn);
+      const apiModels = await fetchAvailableModels(accessToken, apiRegion, creds.profileArn);
       const dynamicDefs = buildModelsFromApi(apiModels);
       setCachedDynamicModels(dynamicDefs);
       modelDefs = toProviderModels(dynamicDefs);
@@ -176,6 +228,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     } catch (err) {
       log.warn(`Failed to fetch models at startup, using hardcoded fallback: ${err}`);
     }
+  } else {
+    log.warn(
+      "Run 'kiro login' to authenticate and fetch models dynamically. Note: This extension does not have the same authentication mechanism as other Kiro tools.",
+    );
   }
 
   pi.registerProvider("kiro", {
@@ -195,8 +251,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
         // Re-seed profileArn after login/refresh so streamKiro can read it.
         if (kc.profileArn) {
-          const runtimeUrl = resolveRuntimeUrl(apiRegion);
-          seedProfileArn(runtimeUrl + "/", kc.profileArn);
+          seedProfileArn(kc.profileArn);
         }
 
         // Stamp provider/api/baseUrl onto a ProviderModelConfig to produce a

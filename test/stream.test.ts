@@ -4,7 +4,6 @@ import type {
   AssistantMessageEvent,
   Context,
   Model,
-  Tool,
   ToolResultMessage,
   UserMessage,
 } from "@earendil-works/pi-ai";
@@ -110,6 +109,12 @@ function mockFetchOk(body: string) {
 describe("streamKiro", () => {
   beforeEach(() => {
     resetProfileArnCache();
+    // Seed a test profileArn for the default model endpoint so the
+    // required-profileArn guard in streamKiro doesn't short-circuit.
+    // Keys use trailing slash (pi convention).
+    seedProfileArn(
+      "arn:aws:codewhisperer:us-east-1:000000000000:profile/test",
+    );
   });
 
   afterEach(() => {
@@ -157,69 +162,6 @@ describe("streamKiro", () => {
     expect(opts.headers["amz-sdk-request"]).toBe("attempt=1; max=3");
     expect(opts.headers.Pragma).toBe("no-cache");
     expect(opts.headers["Cache-Control"]).toBe("no-cache");
-  });
-
-  it("logs safe request.shape diagnostics for tool-use format errors", async () => {
-    const originalLevel = process.env.KIRO_LOG;
-    process.env.KIRO_LOG = "debug";
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    try {
-      const fetchMock = vi.fn().mockResolvedValue({
-        ok: false,
-        status: 400,
-        statusText: "Bad Request",
-        text: () => Promise.resolve('{"message":"Invalid tool use format."}'),
-      });
-      vi.stubGlobal("fetch", fetchMock);
-      const tool: Tool = {
-        name: "bash",
-        description: "Run shell commands",
-        parameters: {
-          type: "object",
-          properties: { cmd: { type: "string" } },
-          required: ["cmd"],
-          additionalProperties: false,
-        },
-      };
-      const context: Context = {
-        systemPrompt: "SECRET_SYSTEM_PROMPT",
-        messages: [
-          user("SECRET_USER_PROMPT"),
-          assistantWithToolCall(),
-          toolResult("tc1", "SECRET_TOOL_RESULT"),
-          user("please continue"),
-        ],
-        tools: [tool],
-      };
-
-      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
-
-      const shapeCall = logSpy.mock.calls.find((call) => String(call[0]).includes("request.shape"));
-      expect(shapeCall).toBeDefined();
-      const shape = shapeCall?.[1] as Record<string, unknown>;
-      expect(shape).toMatchObject({
-        historyLen: expect.any(Number),
-        current: {
-          toolSpecNames: ["bash"],
-        },
-      });
-      const shapeJson = JSON.stringify(shape);
-      expect(shapeJson).toContain("tooluse_");
-      expect(shapeJson).not.toContain("SECRET_USER_PROMPT");
-      expect(shapeJson).not.toContain("SECRET_TOOL_RESULT");
-      expect(shapeJson).not.toContain("SECRET_SYSTEM_PROMPT");
-      expect(shapeJson).not.toContain("SECRET_ARG");
-
-      const errorCall = logSpy.mock.calls.find((call) => String(call[0]).includes("response.error"));
-      expect(errorCall?.[1]).toMatchObject({
-        status: 400,
-        requestShape: shape,
-      });
-    } finally {
-      logSpy.mockRestore();
-      if (originalLevel === undefined) delete process.env.KIRO_LOG;
-      else process.env.KIRO_LOG = originalLevel;
-    }
   });
 
   it("canonicalizes current-turn tool IDs before sending to Kiro", async () => {
@@ -329,9 +271,8 @@ describe("streamKiro", () => {
 
   it("seedProfileArn makes ARN available to streamKiro via getProfileArn", async () => {
     const arn = "arn:aws:codewhisperer:us-east-1:123:profile/TEST";
-    const endpoint = "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
-    seedProfileArn(endpoint, arn);
-    expect(getProfileArn(endpoint)).toBe(arn);
+    seedProfileArn(arn);
+    expect(getProfileArn()).toBe(arn);
 
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
     vi.stubGlobal("fetch", fetchMock);

@@ -1,17 +1,14 @@
 import type {
   AssistantMessage,
   Message,
-  Tool,
   ToolResultMessage,
   UserMessage,
 } from "@earendil-works/pi-ai";
-import { Type } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
   buildHistory,
   collapseAgenticLoops,
   convertImagesToKiro,
-  convertToolsToKiro,
   getContentText,
   type KiroHistoryEntry,
   MAX_KIRO_IMAGE_BYTES,
@@ -100,28 +97,6 @@ describe("getContentText", () => {
       { type: "text", text: "answer" },
     ];
     expect(getContentText(msg)).toBe("hmmanswer");
-  });
-});
-
-describe("convertToolsToKiro", () => {
-  it("wraps pi tools in toolSpecification with __tool_use_purpose", () => {
-    const params = Type.Object({ cmd: Type.String() });
-    const tools: Tool[] = [
-      {
-        name: "bash",
-        description: "Run cmd",
-        parameters: params,
-      },
-    ];
-    const r = convertToolsToKiro(tools);
-    expect(r[0]?.toolSpecification.name).toBe("bash");
-    const schema = r[0]?.toolSpecification.inputSchema.json as Record<string, unknown>;
-    const props = schema.properties as Record<string, unknown>;
-    expect(props.cmd).toEqual({ type: "string" });
-    expect(props.__tool_use_purpose).toEqual({
-      type: "string",
-      description: "A brief explanation why you are making this tool use.",
-    });
   });
 });
 

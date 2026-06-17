@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.4
+
+### Patch Changes
+
+- fix: refresh token at startup before fetching models
+
+  - Always refresh the access token at startup so `ListAvailableModels` never hits an expired token
+  - Persist refreshed credentials back to `auth.json` for other extensions (e.g. pi-usage-bars)
+  - Simplify profileArn store from Map to single variable
+  - Remove unused debug request-shape summary interfaces
+  - Use `dashToDot` in `resolveKiroModel` instead of duplicated regex
+
 ## 0.4.3
 
 ### Patch Changes

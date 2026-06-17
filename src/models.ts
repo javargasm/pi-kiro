@@ -43,7 +43,7 @@ export function dotToDash(modelId: string): string {
 
 /** Convert pi's dash form to the Kiro API's dot form (e.g. 4-6 → 4.6). */
 export function resolveKiroModel(modelId: string): string {
-  const kiroId = modelId.replace(/(\d)-(\d)/g, "$1.$2");
+  const kiroId = dashToDot(modelId);
   if (!KIRO_MODEL_IDS.has(kiroId)) {
     throw new Error(`Unknown Kiro model ID: ${modelId}`);
   }
