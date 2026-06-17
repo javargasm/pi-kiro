@@ -143,9 +143,9 @@ function readKiroCredentials(): { access: string; region: string; profileArn?: s
       }
     }
 
-    // profileArn may be stored in metadata by the login callback
+    // profileArn lives on the kiro entry; fall back to legacy metadata location.
     const metadata = kiro.metadata as Record<string, unknown> | undefined;
-    const profileArn = typeof metadata?.profileArn === "string" ? metadata.profileArn : undefined;
+    const profileArn = [kiro.profileArn, metadata?.profileArn].find((v): v is string => typeof v === "string");
 
     return {
       access: kiro.access,
@@ -163,15 +163,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // it's directly assignable to `toProviderModels` without a cast.
   let modelDefs = toProviderModels(kiroModels);
   const creds = readKiroCredentials();
-  if (creds) {
+  if (creds?.profileArn) {
     try {
       const apiRegion = resolveApiRegion(creds.region);
-      // Seed profileArn cache from auth.json if available, avoiding
-      // a round-trip to ListAvailableProfiles.
-      if (creds.profileArn) {
-        const runtimeUrl = resolveRuntimeUrl(apiRegion);
-        seedProfileArn(runtimeUrl + "/", creds.profileArn);
-      }
+      const runtimeUrl = resolveRuntimeUrl(apiRegion);
+      seedProfileArn(runtimeUrl + "/", creds.profileArn);
       const apiModels = await fetchAvailableModels(creds.access, apiRegion, creds.profileArn);
       const dynamicDefs = buildModelsFromApi(apiModels);
       setCachedDynamicModels(dynamicDefs);
@@ -193,8 +189,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       refreshToken: refreshKiroToken,
       getApiKey: (cred: OAuthCredentials) => cred.access as string,
       modifyModels: (allModels: Model<Api>[], cred: OAuthCredentials): Model<Api>[] => {
-        const apiRegion = resolveApiRegion((cred as KiroCredentials).region);
+        const kc = cred as KiroCredentials;
+        const apiRegion = resolveApiRegion(kc.region);
         const nonKiro = allModels.filter((m) => m.provider !== "kiro");
+
+        // Re-seed profileArn after login/refresh so streamKiro can read it.
+        if (kc.profileArn) {
+          const runtimeUrl = resolveRuntimeUrl(apiRegion);
+          seedProfileArn(runtimeUrl + "/", kc.profileArn);
+        }
 
         // Stamp provider/api/baseUrl onto a ProviderModelConfig to produce a
         // concrete Model<Api>. `Api` and `Provider` are both `… | string`,

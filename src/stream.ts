@@ -168,76 +168,29 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-// ---- profileArn cache --------------------------------------------------
+// ---- profileArn store ---------------------------------------------------
+// The profileArn is sourced from Kiro CLI's local auth storage (SQLite DB
+// or SSO cache) and seeded into this in-memory store at startup or after
+// login/refresh. No API call is made to discover it.
 
-const profileArnCache = new Map<string, string>();
-/**
- * When true, `resolveProfileArn` is a no-op. Tests that don't mock the
- * ListAvailableProfiles endpoint flip this on to avoid firing a real request.
- */
-let profileArnSkipResolution = false;
+const profileArnStore = new Map<string, string>();
 
-/**
- * Reset cache state. Pass `skipResolution: true` to disable profileArn lookup
- * entirely (useful for tests that don't mock ListAvailableProfiles).
- * Production code should never pass true — cache is reset on logout/refresh
- * without disabling resolution.
- */
-export function resetProfileArnCache(skipResolution = false): void {
-  profileArnCache.clear();
-  profileArnSkipResolution = skipResolution;
+/** Clear the store. Tests call this in beforeEach. */
+export function resetProfileArnCache(): void {
+  profileArnStore.clear();
 }
 
 /**
- * Pre-seed the profileArn cache for a given endpoint. When set,
- * `resolveProfileArn` returns the seeded value without hitting the
- * management endpoint. Use this to inject a known profileArn from
- * external sources (e.g. Kiro CLI auth.json) as a fallback when the
- * management API returns 400.
+ * Seed the profileArn for a given endpoint. Called from extension.ts at
+ * startup (reading auth.json) and from oauth.ts after login/refresh.
  */
 export function seedProfileArn(endpoint: string, arn: string): void {
-  profileArnCache.set(endpoint, arn);
+  profileArnStore.set(endpoint, arn);
 }
 
-export async function resolveProfileArn(accessToken: string, endpoint: string): Promise<string | undefined> {
-  if (profileArnSkipResolution) return undefined;
-  const cached = profileArnCache.get(endpoint);
-  if (cached !== undefined) return cached;
-
-  try {
-    // Kiro CLI 2.5+ migrated profile resolution to the management endpoint.
-    // runtime.us-east-1.kiro.dev → management.us-east-1.kiro.dev
-    const ep = new URL(endpoint);
-    ep.hostname = ep.hostname.replace("runtime.", "management.");
-    ep.pathname = "/";
-    ep.search = "";
-    ep.hash = "";
-
-    const resp = await fetch(ep.toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-amz-json-1.0",
-        Authorization: `Bearer ${accessToken}`,
-        "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
-      },
-      body: "{}",
-    });
-    if (!resp.ok) {
-      log.warn(`profileArn resolution failed: ${resp.status} ${resp.statusText}`);
-      return undefined;
-    }
-    const j = (await resp.json()) as { profiles?: Array<{ arn?: string }> };
-    const arn = j.profiles?.find((p) => p.arn)?.arn;
-    if (!arn) {
-      log.warn("profileArn resolution returned no profile ARN");
-      return undefined;
-    }
-    profileArnCache.set(endpoint, arn);
-    return arn;
-  } catch (error) {
-    log.warn(`profileArn resolution threw: ${error instanceof Error ? error.message : String(error)}`);
-    return undefined;
-  }
+/** Read the cached profileArn for a given endpoint. */
+export function getProfileArn(endpoint: string): string | undefined {
+  return profileArnStore.get(endpoint);
 }
 
 // ---- Request body shape ------------------------------------------------
@@ -530,7 +483,7 @@ export function streamKiro(
       }
 
       const endpoint = model.baseUrl || "https://runtime.us-east-1.kiro.dev";
-      const profileArn = await resolveProfileArn(accessToken, endpoint);
+      const profileArn = getProfileArn(endpoint);
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
@@ -955,7 +908,6 @@ export function streamKiro(
           if (response.status === 401) {
             const permanent = isPermanentError(errText);
             if (permanent) {
-              profileArnCache.delete(endpoint);
               throw new Error(
                 `Kiro API error: credentials permanently invalid — run /login kiro to re-authenticate. ${errText}`,
               );
@@ -963,11 +915,6 @@ export function streamKiro(
             // Non-permanent 401 falls through to the generic throw below
           }
           if (response.status === 403) {
-            // Access token was accepted earlier (profileArn resolved) but is
-            // now rejected — drift, revocation, or server-side invalidation.
-            // Bust the profileArn cache so the next attempt re-resolves with
-            // a fresh token, and surface a clear re-login hint.
-            profileArnCache.delete(endpoint);
             throw new Error(
               `Kiro API error: access token rejected (403) — run /login kiro to re-authenticate. ${errText}`,
             );

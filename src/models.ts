@@ -1,4 +1,3 @@
-import { resolveProfileArn } from "./stream.js";
 
 // Kiro model catalog + ID conversion + region mapping.
 //
@@ -460,30 +459,33 @@ export interface KiroApiModel {
 export async function fetchAvailableModels(
   accessToken: string,
   apiRegion: string,
-  fallbackProfileArn?: string,
+  profileArn: string,
 ): Promise<KiroApiModel[]> {
-  const runtimeUrl = `https://runtime.${apiRegion}.kiro.dev/`;
-  let profileArn = await resolveProfileArn(accessToken, runtimeUrl);
-  
-  if (!profileArn && fallbackProfileArn) {
-    profileArn = fallbackProfileArn;
-  }
 
-  if (!profileArn) {
-    throw new Error("Missing profileArn: cannot fetch available models.");
-  }
-
-  const url = `https://management.${apiRegion}.kiro.dev/ListAvailableModels?origin=KIRO_CLI&profileArn=${encodeURIComponent(profileArn)}`;
+  const url = `https://management.${apiRegion}.kiro.dev/?origin=KIRO_CLI&profileArn=${encodeURIComponent(profileArn)}`;
   const resp = await fetch(url, {
-    method: "GET",
+    method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-      "User-Agent": "pi-kiro",
+      "Content-Type": "application/x-amz-json-1.0",
+      "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableModels",
+      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.7.1 app/AmazonQ-For-CLI",
+      "x-amz-user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
+      "x-amzn-codewhisperer-optout": "true",
+      "amz-sdk-request": "attempt=1; max=3",
+      "amz-sdk-invocation-id": crypto.randomUUID(),
+      "accept": "*/*",
+      "Pragma": "no-cache",
+      "Cache-Control": "no-cache",
     },
+    body: JSON.stringify({ origin: "KIRO_CLI", profileArn }),
   });
   if (!resp.ok) {
-    throw new Error(`ListAvailableModels failed: HTTP ${resp.status}`);
+    const body = await resp.text().catch(() => "");
+    if (resp.status === 401 || (resp.status === 400 && body.includes("Invalid token"))) {
+      throw new Error(`Authentication failed: 401 ListAvailableModels failed - ${body}`);
+    }
+    throw new Error(`ListAvailableModels failed: HTTP ${resp.status} - ${body}`);
   }
   const data = (await resp.json()) as { models?: KiroApiModel[] };
   return (data.models ?? []).filter((m) => m.modelId !== "auto");

@@ -9,7 +9,7 @@ import type {
   UserMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { HIDDEN_REASONING_COUNTDOWN_MS, resetProfileArnCache, streamKiro } from "../src/stream";
+import { HIDDEN_REASONING_COUNTDOWN_MS, resetProfileArnCache, seedProfileArn, getProfileArn, streamKiro } from "../src/stream";
 
 function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {
@@ -109,7 +109,7 @@ function mockFetchOk(body: string) {
 
 describe("streamKiro", () => {
   beforeEach(() => {
-    resetProfileArnCache(true);
+    resetProfileArnCache();
   });
 
   afterEach(() => {
@@ -327,40 +327,19 @@ describe("streamKiro", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("resolveProfileArn includes ARN in body and caches per endpoint", async () => {
-    resetProfileArnCache(false);
+  it("seedProfileArn makes ARN available to streamKiro via getProfileArn", async () => {
     const arn = "arn:aws:codewhisperer:us-east-1:123:profile/TEST";
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ profiles: [{ arn }] }) })
-      .mockResolvedValueOnce({
-        ok: true,
-        body: {
-          getReader: () => ({
-            read: vi
-              .fn()
-              .mockResolvedValueOnce({
-                done: false,
-                value: new TextEncoder().encode('{"content":"Hi"}{"contextUsagePercentage":5}'),
-              })
-              .mockResolvedValueOnce({ done: true, value: undefined }),
-            cancel: vi.fn().mockResolvedValue(undefined),
-          }),
-        },
-      });
+    const endpoint = "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
+    seedProfileArn(endpoint, arn);
+    expect(getProfileArn(endpoint)).toBe(arn);
+
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
     vi.stubGlobal("fetch", fetchMock);
     await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-    expect(fetchMock.mock.calls[0]?.[1]?.headers["X-Amz-Target"]).toBe(
-      "AmazonCodeWhispererService.ListAvailableProfiles",
-    );
-    const body = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string);
+    // Only one fetch call — no API call to resolve profileArn.
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
     expect(body.profileArn).toBe(arn);
-
-    // Second call reuses cache (no extra ListAvailableProfiles).
-    const fetchMock2 = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
-    vi.stubGlobal("fetch", fetchMock2);
-    await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-    expect(fetchMock2).toHaveBeenCalledOnce();
   });
 
   it("sends origin: KIRO_CLI and modelId in dot format", async () => {

@@ -79,6 +79,8 @@ export interface KiroCredentials extends OAuthCredentials {
    * - `desktop`: Kiro IDE native install (bare refresh token, no clientId/clientSecret).
    */
   authMethod: "builder-id" | "idc" | "desktop";
+  /** Profile ARN from Kiro, used to scope API calls. */
+  profileArn?: string;
   /** Local Kiro source, used only to decide safe CLI DB write-back. */
   kiroSyncSource?: KiroCredentialSource;
   /** Exact `auth_kv.key` imported from the kiro-cli DB. */
@@ -310,13 +312,15 @@ async function loginCliSync(callbacks: OAuthLoginCallbacks): Promise<KiroCredent
     `${imported.email ? `, ${imported.email}` : ""})`,
   );
 
-  try {
-    const apiRegion = resolveApiRegion(imported.region);
-    const apiModels = await fetchAvailableModels(imported.accessToken, apiRegion, imported.profileArn);
-    setCachedDynamicModels(buildModelsFromApi(apiModels));
-    log.info(`Fetched and cached ${apiModels.length} models after CLI sync`);
-  } catch (err) {
-    log.warn(`Failed to fetch models after CLI sync: ${err}`);
+  if (imported.profileArn) {
+    try {
+      const apiRegion = resolveApiRegion(imported.region);
+      const apiModels = await fetchAvailableModels(imported.accessToken, apiRegion, imported.profileArn);
+      setCachedDynamicModels(buildModelsFromApi(apiModels));
+      log.info(`Fetched and cached ${apiModels.length} models after CLI sync`);
+    } catch (err) {
+      log.warn(`Failed to fetch models after CLI sync: ${err}`);
+    }
   }
 
   // Route through kiroCredsFromCliImport so the struct `authMethod` is
@@ -413,14 +417,9 @@ async function runDeviceCodeFlow(
     throw new Error("Authorization completed but no tokens returned");
   }
 
-  try {
-    const apiRegion = resolveApiRegion(detectedRegion);
-    const apiModels = await fetchAvailableModels(tok.accessToken, apiRegion);
-    setCachedDynamicModels(buildModelsFromApi(apiModels));
-    log.info(`Fetched and cached ${apiModels.length} models after login`);
-  } catch (err) {
-    log.warn(`Failed to fetch models after login, falling back: ${err}`);
-  }
+  // ponytail: no profileArn after device-code flow — models fetched at startup or after CLI sync
+  // Device-code login doesn't receive a profileArn; dynamic models will
+  // load on the next startup when auth.json has the ARN.
 
   return {
     refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|${authMethod}`,
@@ -491,6 +490,7 @@ function kiroCredsFromCliImport(imported: KiroCliCredentials): KiroCredentials {
     clientSecret: imported.clientSecret ?? "",
     region: imported.region,
     authMethod,
+    profileArn: imported.profileArn,
     kiroSyncSource: imported.source,
     kiroSyncTokenKey: imported.tokenKey,
   };
@@ -537,13 +537,15 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
       expiresIn?: number;
     };
 
-    try {
-      const apiRegion = resolveApiRegion(region);
-      const apiModels = await fetchAvailableModels(data.accessToken, apiRegion);
-      setCachedDynamicModels(buildModelsFromApi(apiModels));
-      log.info(`Fetched and cached ${apiModels.length} models after desktop token refresh`);
-    } catch (err) {
-      log.warn(`Failed to fetch models after desktop token refresh: ${err}`);
+    if (credentials.profileArn) {
+      try {
+        const apiRegion = resolveApiRegion(region);
+        const apiModels = await fetchAvailableModels(data.accessToken, apiRegion, credentials.profileArn);
+        setCachedDynamicModels(buildModelsFromApi(apiModels));
+        log.info(`Fetched and cached ${apiModels.length} models after desktop token refresh`);
+      } catch (err) {
+        log.warn(`Failed to fetch models after desktop token refresh: ${err}`);
+      }
     }
 
     return {
@@ -554,6 +556,7 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
       clientSecret: "",
       region,
       authMethod: "desktop",
+      profileArn: credentials.profileArn,
       kiroSyncSource: credentials.kiroSyncSource,
       kiroSyncTokenKey: credentials.kiroSyncTokenKey,
     };
@@ -576,13 +579,15 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
     expiresIn?: number;
   };
 
-  try {
-    const apiRegion = resolveApiRegion(region);
-    const apiModels = await fetchAvailableModels(data.accessToken, apiRegion);
-    setCachedDynamicModels(buildModelsFromApi(apiModels));
-    log.info(`Fetched and cached ${apiModels.length} models after token refresh`);
-  } catch (err) {
-    log.warn(`Failed to fetch models after token refresh, falling back: ${err}`);
+  if (credentials.profileArn) {
+    try {
+      const apiRegion = resolveApiRegion(region);
+      const apiModels = await fetchAvailableModels(data.accessToken, apiRegion, credentials.profileArn);
+      setCachedDynamicModels(buildModelsFromApi(apiModels));
+      log.info(`Fetched and cached ${apiModels.length} models after token refresh`);
+    } catch (err) {
+      log.warn(`Failed to fetch models after token refresh, falling back: ${err}`);
+    }
   }
 
   return {
@@ -593,6 +598,7 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
     clientSecret,
     region,
     authMethod,
+    profileArn: credentials.profileArn,
     kiroSyncSource: credentials.kiroSyncSource,
     kiroSyncTokenKey: credentials.kiroSyncTokenKey,
   };
