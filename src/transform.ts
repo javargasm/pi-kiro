@@ -350,7 +350,66 @@ export function buildHistory(
     }
   }
 
-  return { history: collapseAgenticLoops(history), systemPrepended, currentMsgStartIdx };
+  return { history: sanitizeHistory(collapseAgenticLoops(history)), systemPrepended, currentMsgStartIdx };
+}
+
+// ---- History sanitization ---------------------------------------------
+
+/**
+ * Sanitize the Kiro history to prevent Bedrock validation errors:
+ *
+ * 1. **TOOL_DUPLICATE**: Deduplicate toolUseIds within each assistant
+ *    message — keep the first occurrence, drop subsequent ones.
+ *
+ * 2. **TOOL_USE_RESULT_MISMATCH**: Every ASST with toolUses must be
+ *    followed by a USER with toolResults whose IDs match. Remove
+ *    orphan toolUses that have no matching toolResult in the next
+ *    message, and remove orphan toolResults whose toolUse doesn't
+ *    exist in the preceding assistant.
+ *
+ * This runs as a defensive last pass — upstream logic (buildHistory,
+ * stream.ts current-turn assembly) should produce correct output, but
+ * edge cases in retry / cross-provider handoff can violate the
+ * invariants Bedrock enforces.
+ */
+export function sanitizeHistory(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
+  for (let i = 0; i < history.length; i++) {
+    const entry = history[i];
+    const arm = entry?.assistantResponseMessage;
+    if (!arm?.toolUses || arm.toolUses.length === 0) continue;
+
+    // 1. Deduplicate toolUseIds within the same assistant message.
+    const seen = new Set<string>();
+    arm.toolUses = arm.toolUses.filter((tu) => {
+      if (seen.has(tu.toolUseId)) return false;
+      seen.add(tu.toolUseId);
+      return true;
+    });
+
+    // 2. Ensure the next entry is a USER with matching toolResults.
+    const next = i + 1 < history.length ? history[i + 1] : undefined;
+    const toolResults = next?.userInputMessage?.userInputMessageContext?.toolResults;
+    if (!toolResults) {
+      // No matching toolResults at all — strip toolUses to avoid
+      // TOOL_USE_RESULT_MISMATCH.
+      delete arm.toolUses;
+      continue;
+    }
+
+    const resultIdSet = new Set(toolResults.map((tr) => tr.toolUseId));
+    const useIdSet = new Set(arm.toolUses.map((tu) => tu.toolUseId));
+
+    // Remove toolUses without a matching toolResult.
+    arm.toolUses = arm.toolUses.filter((tu) => resultIdSet.has(tu.toolUseId));
+    if (arm.toolUses.length === 0) delete arm.toolUses;
+
+    // Remove toolResults without a matching toolUse.
+    const ctx = next!.userInputMessage!.userInputMessageContext!;
+    ctx.toolResults = toolResults.filter((tr) => useIdSet.has(tr.toolUseId));
+    if (ctx.toolResults.length === 0) delete ctx.toolResults;
+  }
+
+  return history;
 }
 
 // ---- Agentic loop collapse --------------------------------------------

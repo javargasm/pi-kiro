@@ -14,6 +14,7 @@ import {
   MAX_KIRO_IMAGE_BYTES,
   MAX_KIRO_IMAGES,
   normalizeMessages,
+  sanitizeHistory,
   TOOL_RESULT_LIMIT,
   toKiroToolUseId,
   truncate,
@@ -380,5 +381,158 @@ describe("buildHistory", () => {
     const msgs: Message[] = [user("q"), a, user("followup")];
     const { history } = buildHistory(msgs, "M");
     expect(history.find((h) => h.assistantResponseMessage)).toBeUndefined();
+  });
+});
+
+describe("sanitizeHistory", () => {
+  const asstWithTool = (toolName: string, toolId: string): KiroHistoryEntry => ({
+    assistantResponseMessage: {
+      content: "text",
+      toolUses: [{ name: toolName, toolUseId: toolId, input: {} }],
+    },
+  });
+
+  const userWithToolResult = (toolId: string): KiroHistoryEntry => ({
+    userInputMessage: {
+      content: "Tool results provided.",
+      origin: "KIRO_CLI" as const,
+      userInputMessageContext: {
+        toolResults: [{
+          content: [{ text: "ok" }],
+          status: "success" as const,
+          toolUseId: toolId,
+        }],
+      },
+    },
+  });
+
+  it("deduplicates toolUseIds within the same assistant message (TOOL_DUPLICATE)", () => {
+    const h: KiroHistoryEntry[] = [
+      {
+        assistantResponseMessage: {
+          content: "text",
+          toolUses: [
+            { name: "bash", toolUseId: "tooluse_AAA", input: { cmd: "ls" } },
+            { name: "bash", toolUseId: "tooluse_AAA", input: { cmd: "pwd" } },
+            { name: "read", toolUseId: "tooluse_BBB", input: {} },
+          ],
+        },
+      },
+      {
+        userInputMessage: {
+          content: "Tool results provided.",
+          origin: "KIRO_CLI" as const,
+          userInputMessageContext: {
+            toolResults: [
+              { content: [{ text: "r1" }], status: "success" as const, toolUseId: "tooluse_AAA" },
+              { content: [{ text: "r2" }], status: "success" as const, toolUseId: "tooluse_BBB" },
+            ],
+          },
+        },
+      },
+    ];
+    const result = sanitizeHistory(h);
+    const uses = result[0]?.assistantResponseMessage?.toolUses;
+    expect(uses).toHaveLength(2);
+    expect(uses?.map((u) => u.toolUseId)).toEqual(["tooluse_AAA", "tooluse_BBB"]);
+  });
+
+  it("strips orphan toolUses without matching toolResults (TOOL_USE_RESULT_MISMATCH)", () => {
+    const h: KiroHistoryEntry[] = [
+      {
+        assistantResponseMessage: {
+          content: "text",
+          toolUses: [
+            { name: "bash", toolUseId: "tooluse_AAA", input: {} },
+            { name: "read", toolUseId: "tooluse_BBB", input: {} },
+          ],
+        },
+      },
+      {
+        userInputMessage: {
+          content: "Tool results provided.",
+          origin: "KIRO_CLI" as const,
+          userInputMessageContext: {
+            toolResults: [
+              { content: [{ text: "r1" }], status: "success" as const, toolUseId: "tooluse_AAA" },
+              // tooluse_BBB result is MISSING
+            ],
+          },
+        },
+      },
+    ];
+    const result = sanitizeHistory(h);
+    const uses = result[0]?.assistantResponseMessage?.toolUses;
+    expect(uses).toHaveLength(1);
+    expect(uses?.[0]?.toolUseId).toBe("tooluse_AAA");
+  });
+
+  it("strips orphan toolResults without matching toolUses", () => {
+    const h: KiroHistoryEntry[] = [
+      {
+        assistantResponseMessage: {
+          content: "text",
+          toolUses: [
+            { name: "bash", toolUseId: "tooluse_AAA", input: {} },
+          ],
+        },
+      },
+      {
+        userInputMessage: {
+          content: "Tool results provided.",
+          origin: "KIRO_CLI" as const,
+          userInputMessageContext: {
+            toolResults: [
+              { content: [{ text: "r1" }], status: "success" as const, toolUseId: "tooluse_AAA" },
+              { content: [{ text: "r2" }], status: "success" as const, toolUseId: "tooluse_ORPHAN" },
+            ],
+          },
+        },
+      },
+    ];
+    const result = sanitizeHistory(h);
+    const results = result[1]?.userInputMessage?.userInputMessageContext?.toolResults;
+    expect(results).toHaveLength(1);
+    expect(results?.[0]?.toolUseId).toBe("tooluse_AAA");
+  });
+
+  it("strips toolUses when next entry has no toolResults at all", () => {
+    const h: KiroHistoryEntry[] = [
+      {
+        assistantResponseMessage: {
+          content: "text",
+          toolUses: [
+            { name: "bash", toolUseId: "tooluse_AAA", input: {} },
+          ],
+        },
+      },
+      {
+        userInputMessage: {
+          content: "next question",
+          origin: "KIRO_CLI" as const,
+        },
+      },
+    ];
+    const result = sanitizeHistory(h);
+    expect(result[0]?.assistantResponseMessage?.toolUses).toBeUndefined();
+  });
+
+  it("leaves valid pairs unchanged", () => {
+    const h: KiroHistoryEntry[] = [
+      asstWithTool("bash", "tooluse_AAA"),
+      userWithToolResult("tooluse_AAA"),
+    ];
+    const result = sanitizeHistory(h);
+    expect(result[0]?.assistantResponseMessage?.toolUses).toHaveLength(1);
+    expect(result[1]?.userInputMessage?.userInputMessageContext?.toolResults).toHaveLength(1);
+  });
+
+  it("handles assistant with toolUses as last entry (no following message)", () => {
+    const h: KiroHistoryEntry[] = [
+      asstWithTool("bash", "tooluse_AAA"),
+    ];
+    const result = sanitizeHistory(h);
+    // toolUses stripped because there's no next message with results
+    expect(result[0]?.assistantResponseMessage?.toolUses).toBeUndefined();
   });
 });

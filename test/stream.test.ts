@@ -922,4 +922,265 @@ describe("streamKiro", () => {
       expect(body.additionalModelRequestFields?.output_config).toBeUndefined();
     });
   });
+
+  describe("Bedrock tool-use validation (e2e through streamKiro)", () => {
+    /**
+     * Helper: extract EVERY toolUseId and toolResultId from a Kiro request
+     * body and validate Bedrock's two invariants:
+     * 1. No duplicate toolUseIds within any single assistant message
+     * 2. Every toolUse has a matching toolResult in the NEXT message
+     */
+    function validateBedrockInvariants(body: any): { errors: string[] } {
+      const errors: string[] = [];
+      const history: any[] = body.conversationState.history ?? [];
+
+      for (let i = 0; i < history.length; i++) {
+        const entry = history[i];
+        const arm = entry?.assistantResponseMessage;
+        if (!arm?.toolUses || arm.toolUses.length === 0) continue;
+
+        // Check 1: no duplicate toolUseIds in the same assistant content
+        const useIds = arm.toolUses.map((tu: any) => tu.toolUseId);
+        const seen = new Set<string>();
+        for (const id of useIds) {
+          if (seen.has(id)) {
+            errors.push(`TOOL_DUPLICATE: entry[${i}] has duplicate toolUseId "${id}"`);
+          }
+          seen.add(id);
+        }
+
+        // Check 2: every toolUse must have a matching toolResult
+        const next = i + 1 < history.length ? history[i + 1] : undefined;
+        const results = next?.userInputMessage?.userInputMessageContext?.toolResults;
+        const resultIdSet = new Set((results ?? []).map((tr: any) => tr.toolUseId));
+
+        for (const id of useIds) {
+          if (!resultIdSet.has(id)) {
+            errors.push(`TOOL_USE_RESULT_MISMATCH: entry[${i}] toolUse "${id}" has no matching toolResult in entry[${i + 1}]`);
+          }
+        }
+      }
+
+      // Also check the last history entry against currentMessage
+      const lastEntry = history[history.length - 1];
+      if (lastEntry?.assistantResponseMessage?.toolUses?.length > 0) {
+        const currentResults = body.conversationState.currentMessage
+          ?.userInputMessage?.userInputMessageContext?.toolResults ?? [];
+        const resultIdSet = new Set(currentResults.map((tr: any) => tr.toolUseId));
+        for (const tu of lastEntry.assistantResponseMessage.toolUses) {
+          if (!resultIdSet.has(tu.toolUseId)) {
+            errors.push(
+              `TOOL_USE_RESULT_MISMATCH: last history ASST toolUse "${tu.toolUseId}" has no matching toolResult in currentMessage`,
+            );
+          }
+        }
+      }
+
+      return { errors };
+    }
+
+    it("e2e: agentic loop with tool calls produces valid request (no TOOL_DUPLICATE, no MISMATCH)", async () => {
+      // Simulate a multi-turn agentic conversation:
+      // user → asst(toolCall) → toolResult → asst(toolCall) → toolResult → user(current)
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+
+      const context: Context = {
+        systemPrompt: "You are helpful",
+        messages: [
+          user("do a thing"),
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "Let me check" },
+              { type: "toolCall", id: "tooluse_AAAA", name: "bash", arguments: { cmd: "ls" } },
+              { type: "toolCall", id: "tooluse_BBBB", name: "read", arguments: { path: "f.ts" } },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          toolResult("tooluse_AAAA", "file1.ts"),
+          toolResult("tooluse_BBBB", "contents"),
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "Now writing" },
+              { type: "toolCall", id: "tooluse_CCCC", name: "write", arguments: { path: "f.ts" } },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          toolResult("tooluse_CCCC", "done"),
+          user("looks good"),
+        ],
+        tools: [],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const { errors } = validateBedrockInvariants(body);
+      expect(errors).toEqual([]);
+    });
+
+    it("e2e: cross-provider handoff with non-Kiro tool IDs produces valid request", async () => {
+      // Simulate messages from another provider (e.g. Anthropic) with
+      // non-Kiro format IDs that toKiroToolUseId must canonicalize.
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+
+      const foreignId1 = "call_abc123|fc_def456";
+      const foreignId2 = "call_xyz789|fc_uvw012";
+      const context: Context = {
+        systemPrompt: "You are helpful",
+        messages: [
+          user("check files"),
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: foreignId1, name: "bash", arguments: { cmd: "ls" } },
+              { type: "toolCall", id: foreignId2, name: "read", arguments: { path: "a.ts" } },
+            ],
+            api: "anthropic",
+            provider: "anthropic",
+            model: "claude-3",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          toolResult(foreignId1, "file list"),
+          toolResult(foreignId2, "file contents"),
+          user("now what?"),
+        ],
+        tools: [],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const { errors } = validateBedrockInvariants(body);
+      expect(errors).toEqual([]);
+
+      // Verify IDs were canonicalized to Kiro format
+      const bodyStr = JSON.stringify(body);
+      expect(bodyStr).not.toContain(foreignId1);
+      expect(bodyStr).not.toContain(foreignId2);
+    });
+
+    it("e2e: assistant with toolUses but missing tool results gets sanitized (no MISMATCH)", async () => {
+      // Edge case: pi sends an assistant with tool calls but the tool
+      // results are missing (e.g. aborted mid-turn, partial history).
+      // Without sanitization this would cause TOOL_USE_RESULT_MISMATCH.
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+
+      const context: Context = {
+        systemPrompt: "You are helpful",
+        messages: [
+          user("do something"),
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "I'll check" },
+              { type: "toolCall", id: "tooluse_AAAA", name: "bash", arguments: { cmd: "ls" } },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          // toolResult for AAAA present
+          toolResult("tooluse_AAAA", "ok"),
+          // Second assistant also calls a tool...
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "Let me do more" },
+              { type: "toolCall", id: "tooluse_BBBB", name: "write", arguments: {} },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          // ...but its toolResult is present, followed by a new user msg
+          toolResult("tooluse_BBBB", "written"),
+          // Third assistant calls a tool but result is MISSING (aborted)
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "One more thing" },
+              { type: "toolCall", id: "tooluse_DDDD", name: "bash", arguments: { cmd: "pwd" } },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            // stopReason "stop" instead of "toolUse" — pi might set this on abort
+            stopReason: "stop",
+            timestamp: ts,
+          },
+          // No toolResult for DDDD — this is the orphan
+          user("continue please"),
+        ],
+        tools: [],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const { errors } = validateBedrockInvariants(body);
+      expect(errors).toEqual([]);
+    });
+
+    it("e2e: duplicate tool call IDs in same assistant content get deduplicated (no TOOL_DUPLICATE)", async () => {
+      // Pathological case: same toolCall ID appears twice in one assistant
+      // message. Can happen via cross-provider handoff bugs or harness issues.
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.stubGlobal("fetch", fetchMock);
+
+      const context: Context = {
+        systemPrompt: "You are helpful",
+        messages: [
+          user("go"),
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "tooluse_SAME", name: "bash", arguments: { cmd: "ls" } },
+              { type: "toolCall", id: "tooluse_SAME", name: "bash", arguments: { cmd: "pwd" } },
+              { type: "toolCall", id: "tooluse_OTHER", name: "read", arguments: {} },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          toolResult("tooluse_SAME", "file list"),
+          toolResult("tooluse_OTHER", "contents"),
+          user("next"),
+        ],
+        tools: [],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const { errors } = validateBedrockInvariants(body);
+      expect(errors).toEqual([]);
+    });
+  });
 });
