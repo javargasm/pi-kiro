@@ -12,6 +12,12 @@ describe("log levels", () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    // Start from a clean slate, independent of the ambient shell env.
+    // If KIRO_LOG_FILE is exported (e.g. a capture session), the logger
+    // redirects to file and these console spies never fire — breaking
+    // these console-focused tests. Each test sets its own KIRO_LOG.
+    delete process.env.KIRO_LOG;
+    delete process.env.KIRO_LOG_FILE;
     errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -85,6 +91,9 @@ describe("KIRO_LOG_FILE redirection", () => {
   let tmp: string;
 
   beforeEach(() => {
+    // Start from a clean slate, independent of the ambient shell env.
+    delete process.env.KIRO_LOG;
+    delete process.env.KIRO_LOG_FILE;
     errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
