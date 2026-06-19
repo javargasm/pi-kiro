@@ -60,6 +60,16 @@ describe("parseKiroEvent", () => {
       data: { inputTokens: 100, outputTokens: 50 },
     });
   });
+  it("does NOT treat a metering frame (numeric usage) as a usage event", () => {
+    // Real frame captured from Kiro CLI:
+    // {"unit":"credit","unitPlural":"credits","usage":0.17618616013267}
+    // The numeric `usage` is a credit cost, not token counts. Before the
+    // typeof guard this returned a bogus usage event with undefined tokens,
+    // clobbering a real usageEvent earlier in the stream.
+    expect(
+      parseKiroEvent({ unit: "credit", unitPlural: "credits", usage: 0.17618616013267 }),
+    ).toBeNull();
+  });
   it("returns error event", () => {
     expect(parseKiroEvent({ error: "ThrottlingException", message: "wait" })).toEqual({
       type: "error",

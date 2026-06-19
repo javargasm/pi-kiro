@@ -127,7 +127,12 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
     };
   }
 
-  if (parsed.usage !== undefined) {
+  if (parsed.usage !== undefined && typeof parsed.usage === "object" && parsed.usage !== null) {
+    // A real usageEvent carries an OBJECT ({inputTokens, outputTokens}). A
+    // meteringEvent ({"unit":"credit","usage":<number>}) also has a `usage`
+    // key, but its value is a NUMBER (credit cost). Without the object guard,
+    // a metering frame emits a bogus usage event with undefined tokens, which
+    // clobbers a real usageEvent that arrived earlier in the same stream.
     const u = parsed.usage as Record<string, unknown>;
     return {
       type: "usage",
