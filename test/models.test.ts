@@ -11,7 +11,7 @@ describe("resolveKiroModel", () => {
   it("converts dashes between digits to dots", () => {
     expect(resolveKiroModel("claude-sonnet-4-6")).toBe("claude-sonnet-4.6");
     expect(resolveKiroModel("claude-opus-4-7")).toBe("claude-opus-4.7");
-    expect(resolveKiroModel("glm-4-7-flash")).toBe("glm-4.7-flash");
+    expect(resolveKiroModel("minimax-m2-5")).toBe("minimax-m2.5");
   });
 
   it("preserves IDs without digit-dash-digit patterns", () => {
@@ -59,11 +59,19 @@ describe("filterModelsByRegion", () => {
     expect(r.find((m) => m.id === "claude-opus-4-7")).toBeDefined();
   });
 
-  it("returns a narrower subset for eu-central-1", () => {
+  it("eu-central-1 is a subset of us-east-1", () => {
+    // Historically eu-central-1 carried fewer models than us-east-1, and the
+    // difference was exactly the now-removed stale models (1M variants +
+    // third-party deepseek/kimi/glm/qwen-480b/agi-nova). After the stale
+    // cleanup both regions expose the same mainstream set, so the durable
+    // invariant is subset (⊆), not strict-smaller (<).
     const us = filterModelsByRegion(kiroModels, "us-east-1");
     const eu = filterModelsByRegion(kiroModels, "eu-central-1");
     expect(eu.length).toBeGreaterThan(0);
-    expect(eu.length).toBeLessThan(us.length);
+    const usIds = new Set(us.map((m) => m.id));
+    for (const m of eu) {
+      expect(usIds.has(m.id)).toBe(true);
+    }
   });
 
   it("returns empty for unknown regions", () => {
