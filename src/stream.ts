@@ -29,6 +29,8 @@ import {
   convertImagesToKiro,
   extractImages,
   getContentText,
+  historyHasToolBlocks,
+  KIRO_PLACEHOLDER_TOOL,
   type KiroEnvState,
   type KiroHistoryEntry,
   type KiroImage,
@@ -560,6 +562,16 @@ export function streamKiro(
               },
             };
           });
+        } else if (historyHasToolBlocks(history) || currentToolResults.length > 0) {
+          // Bedrock rejects a request with TOOL_CONFIG_MISSING when the
+          // conversation contains toolUse/toolResult blocks but no toolConfig
+          // is defined. pi sends auxiliary turns (title generation,
+          // summarization, compaction) WITHOUT tools, yet the replayed history
+          // still carries tool blocks from earlier turns — so the request 400s
+          // and retries identically in a loop. When tool blocks are present but
+          // no tools were supplied, inject a minimal placeholder tool so
+          // toolConfig exists. The model won't call it on these auxiliary turns.
+          uimc.tools = [KIRO_PLACEHOLDER_TOOL];
         }
 
         if (firstMsg?.role === "user") {
