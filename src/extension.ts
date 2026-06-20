@@ -60,6 +60,7 @@ interface ProviderModelConfig {
   headers?: Record<string, string>;
   compat?: Model<Api>["compat"];
   firstTokenTimeout?: number;
+  idleTimeout?: number;
   reasoningHidden?: boolean;
   thinkingLevelMap?: Partial<Record<string, string | null>>;
 }
@@ -110,6 +111,7 @@ function toProviderModels(defs: readonly KiroModelDef[]): ProviderModelConfig[] 
     contextWindow: d.contextWindow,
     maxTokens: d.maxTokens,
     firstTokenTimeout: d.firstTokenTimeout,
+    idleTimeout: d.idleTimeout,
     ...(d.reasoningHidden ? { reasoningHidden: d.reasoningHidden } : {}),
     ...(d.reasoning
       ? {

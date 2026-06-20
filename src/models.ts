@@ -165,6 +165,13 @@ export interface KiroModel {
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
   /**
+   * Optional per-model override for the inter-event idle timeout (ms).
+   * High-effort reasoning models (Opus, Fable) can go quiet for long
+   * stretches between parsed events while deliberating; the default
+   * 60s idle window trips mid-think on those. Set higher for them.
+   */
+  idleTimeout?: number;
+  /**
    * Upstream is expected to hide reasoning from clients — tags and
    * native reasoning events should be absent. When set:
    *
@@ -209,6 +216,7 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -221,6 +229,7 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -233,6 +242,7 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -437,6 +447,17 @@ function firstTokenTimeout(dotId: string): number {
   return 90_000;
 }
 
+/**
+ * Inter-event idle timeout for slow models. High-effort reasoning models
+ * can sit silent (no parsed event) for well over the default 60s while
+ * deliberating, which trips the idle timer mid-think. Match the generous
+ * first-token window for Opus/Fable; leave others on the 60s default.
+ */
+function idleTimeout(dotId: string): number {
+  if (dotId.startsWith("claude-fable") || dotId.startsWith("claude-opus")) return 180_000;
+  return 60_000;
+}
+
 export interface KiroModelDef {
   id: string;
   name: string;
@@ -445,6 +466,7 @@ export interface KiroModelDef {
   contextWindow: number;
   maxTokens: number;
   firstTokenTimeout?: number;
+  idleTimeout?: number;
   reasoningHidden?: boolean;
   supportedEfforts?: string[];
   supportsThinkingConfig?: boolean;
@@ -487,6 +509,7 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModelDef[] {
       contextWindow: m.tokenLimits?.maxInputTokens ?? 200_000,
       maxTokens: m.tokenLimits?.maxOutputTokens ?? 8_192,
       firstTokenTimeout: firstTokenTimeout(m.modelId),
+      idleTimeout: idleTimeout(m.modelId),
       // Per-model overrides for known special cases
       ...(supportedEfforts ? { supportedEfforts } : {}),
       ...(supportsThinkingConfig ? { supportsThinkingConfig } : {}),

@@ -100,6 +100,11 @@ export function firstTokenTimeoutForModel(modelId: string): number {
   return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
 }
 
+function idleTimeoutForModel(modelId: string): number {
+  const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
+  return m?.idleTimeout ?? IDLE_TIMEOUT_MS;
+}
+
 /**
  * Map Kiro's authoritative metadataEvent stopReason (real wire values:
  * TOOL_USE / END_TURN / MAX_TOKENS, occasionally STOP_SEQUENCE) onto the
@@ -909,12 +914,13 @@ export function streamKiro(
 
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
         let idleCancelled = false;
+        const idleTimeoutMs = idleTimeoutForModel(model.id);
         const resetIdle = () => {
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
             idleCancelled = true;
             void reader.cancel().catch(() => {});
-          }, IDLE_TIMEOUT_MS);
+          }, idleTimeoutMs);
         };
 
         let gotFirstToken = false;

@@ -94,4 +94,17 @@ describe("kiroModels catalog", () => {
     const ids = kiroModels.map((m) => m.id);
     expect(new Set(ids).size).toBe(ids.length);
   });
+
+  it("high-effort reasoning models get an extended idle timeout", () => {
+    // These models can sit silent (no parsed event) for long stretches
+    // while deliberating at high/xhigh effort. A tight idle window trips
+    // mid-think; the idle window must be at least as generous as the
+    // first-token window for them.
+    for (const id of ["claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"]) {
+      const m = kiroModels.find((x) => x.id === id);
+      expect(m, `missing model ${id}`).toBeDefined();
+      expect(m?.idleTimeout).toBe(180_000);
+      expect(m?.idleTimeout ?? 0).toBeGreaterThanOrEqual(m?.firstTokenTimeout ?? 0);
+    }
+  });
 });
