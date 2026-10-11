@@ -24,12 +24,12 @@
 // This module reads from the kiro-cli SQLite DB first (preferred: gives
 // full OIDC creds), then falls back to the Kiro IDE SSO cache JSON
 // (weaker: no OIDC creds, refresh must go through the desktop endpoint).
-// SQLite access uses bun:sqlite when available, optional better-sqlite3 when
-// installed, then the system sqlite3 CLI for Node-based pi runtimes. Both
-// paths are readonly on import. Refresh write-back is limited to credentials
-// that originated from the kiro-cli SQLite DB, and updates the exact token row
-// that was imported so desktop/IDE refresh tokens are never mixed into CLI
-// token storage.
+// SQLite access uses bun:sqlite when running under Bun, otherwise Node's
+// built-in node:sqlite (Node >= 22.13 — the usual path, since pi runs
+// extensions on Node). Imports open the DB read-only. Refresh write-back is
+// limited to credentials that originated from the kiro-cli SQLite DB, and
+// updates the exact token row that was imported so desktop/IDE refresh
+// tokens are never mixed into CLI token storage.
 //
 // This enables zero-friction login: if the user has kiro-cli or Kiro
 // IDE installed and logged in, pi-kiro can import the credentials
@@ -37,7 +37,6 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { log } from "./debug";
 
@@ -84,7 +83,31 @@ interface SqliteDatabaseConstructor {
   new (path: string, options?: { readonly?: boolean }): SqliteDb;
 }
 
-const SQLITE_CLI_TIMEOUT_MS = 5000;
+/**
+ * Resolve a SQLite driver: `bun:sqlite` (when running under Bun), then
+ * Node's built-in `node:sqlite` (works on a plain Node pi install with zero
+ * extra dependencies — the common case, since pi usually runs extensions on
+ * Node). Returns null when neither is available. Never throws.
+ */
+async function loadSqliteDriver(): Promise<SqliteDatabaseConstructor | null> {
+  try {
+    // @ts-ignore - bun:sqlite is a Bun-only built-in; may not resolve under all TS versions
+    return (await import("bun:sqlite")).Database as SqliteDatabaseConstructor;
+  } catch {
+    // Not running under Bun — fall through.
+  }
+  try {
+    // DatabaseSync already matches SqliteDb; only the constructor differs,
+    // taking `readOnly` where bun:sqlite takes `readonly`.
+    const { DatabaseSync } = await import("node:sqlite");
+    return function (path: string, options?: { readonly?: boolean }) {
+      return new DatabaseSync(path, { readOnly: options?.readonly });
+    } as unknown as SqliteDatabaseConstructor;
+  } catch {
+    log.debug("No SQLite driver available (bun:sqlite, node:sqlite)");
+    return null;
+  }
+}
 
 /**
  * Platform-specific path to kiro-cli's SQLite credential database
@@ -151,130 +174,6 @@ function safeJsonParse(value: unknown): any {
   }
 }
 
-function sqliteQuote(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-function runSqliteCli(
-  dbPath: string,
-  sql: string,
-  options: { readonly: boolean; json: boolean },
-): Promise<string | null> {
-  return new Promise((resolve) => {
-    const args = [
-      ...(options.readonly ? ["-readonly"] : []),
-      "-cmd",
-      `.timeout ${SQLITE_CLI_TIMEOUT_MS}`,
-      ...(options.json ? ["-json"] : []),
-      dbPath,
-    ];
-    const child = spawn("sqlite3", args, { stdio: "pipe" });
-    let stdout = "";
-    let settled = false;
-
-    const finish = (result: string | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve(result);
-    };
-
-    const timeout = setTimeout(() => {
-      child.kill();
-      log.debug("sqlite3 CLI timed out while reading Kiro DB");
-      finish(null);
-    }, SQLITE_CLI_TIMEOUT_MS);
-
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.on("error", () => {
-      log.debug("sqlite3 CLI unavailable for Kiro DB access");
-      finish(null);
-    });
-    child.on("close", (code) => {
-      if (code === 0) finish(stdout);
-      else {
-        log.debug("sqlite3 CLI failed while accessing Kiro DB");
-        finish(null);
-      }
-    });
-    child.stdin?.end(`${sql}\n`);
-  });
-}
-
-function parseAuthKvRows(value: unknown): AuthKvRow[] | null {
-  if (!Array.isArray(value)) return null;
-  const rows: AuthKvRow[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    if (typeof record.key === "string" && typeof record.value === "string") {
-      rows.push({ key: record.key, value: record.value });
-    }
-  }
-  return rows;
-}
-
-function extractActiveProfileArnFromStateRows(value: unknown): string | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const first = value[0];
-  if (!first || typeof first !== "object") return undefined;
-  const record = first as Record<string, unknown>;
-  const parsed = safeJsonParse(record.value);
-  const arn = parsed?.arn || parsed?.profileArn || parsed?.profile_arn;
-  return typeof arn === "string" && arn.trim() ? arn.trim() : undefined;
-}
-
-function parseSqliteChanges(value: unknown): number {
-  if (!Array.isArray(value)) return 0;
-  const first = value[0];
-  if (!first || typeof first !== "object") return 0;
-  const changes = (first as Record<string, unknown>).changes;
-  return typeof changes === "number" ? changes : 0;
-}
-
-async function readKiroAuthKvRowsWithSqliteCli(dbPath: string): Promise<AuthKvRow[] | null> {
-  const rowsRaw = await runSqliteCli(
-    dbPath,
-    "SELECT key, value FROM auth_kv",
-    { readonly: true, json: true },
-  );
-  if (!rowsRaw) return null;
-
-  return parseAuthKvRows(safeJsonParse(rowsRaw));
-}
-
-async function readKiroDbWithSqliteCli(dbPath: string): Promise<KiroDbSnapshot | null> {
-  const rows = await readKiroAuthKvRowsWithSqliteCli(dbPath);
-  if (!rows) return null;
-
-  const stateRaw = await runSqliteCli(
-    dbPath,
-    "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",
-    { readonly: true, json: true },
-  );
-  const activeProfileArn = stateRaw
-    ? extractActiveProfileArnFromStateRows(safeJsonParse(stateRaw))
-    : undefined;
-  return { rows, activeProfileArn };
-}
-
-async function writeKiroDbWithSqliteCli(
-  dbPath: string,
-  tokenKey: string,
-  updatedValue: string,
-): Promise<boolean> {
-  const resultRaw = await runSqliteCli(
-    dbPath,
-    `UPDATE auth_kv SET value = ${sqliteQuote(updatedValue)} WHERE key = ${sqliteQuote(tokenKey)}; ` +
-      "SELECT changes() AS changes",
-    { readonly: false, json: true },
-  );
-  return parseSqliteChanges(safeJsonParse(resultRaw)) > 0;
-}
-
 /**
  * Recursively search a nested object for the OIDC clientId + clientSecret.
  * kiro-cli writes these as `client_id` / `client_secret` (snake_case) in
@@ -317,22 +216,7 @@ export function selectKiroTokenRowForWrite(
   rows: AuthKvRow[],
   creds: Pick<KiroCliCredentials, "authMethod" | "tokenKey">,
 ): AuthKvRow | undefined {
-  const tokenRows = rows.filter(isTokenRow);
-  if (!creds.tokenKey) return undefined;
-  return tokenRows.find((row) => row.key === creds.tokenKey);
-}
-
-export function sameKiroCliCredential(
-  left: KiroCliCredentials | null,
-  right: KiroCliCredentials | null,
-): boolean {
-  if (!left || !right) return false;
-  return left.source === right.source &&
-    left.tokenKey === right.tokenKey &&
-    left.accessToken === right.accessToken &&
-    left.refreshToken === right.refreshToken &&
-    left.region === right.region &&
-    left.authMethod === right.authMethod;
+  return rows.find((row) => row.key === creds.tokenKey && isTokenRow(row));
 }
 
 /**
@@ -365,67 +249,46 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
   }
 
   try {
-    let rows: AuthKvRow[];
-    let activeProfileArn: string | undefined;
+    const Database = await loadSqliteDriver();
+    if (!Database) return null;
 
-    // Dynamic import: try bun:sqlite first, fallback to better-sqlite3, then
-    // sqlite3 CLI. Pi usually runs extensions on Node, so bun:sqlite is not
-    // available there; the CLI fallback keeps DB import dependency-free.
-    let Database: SqliteDatabaseConstructor | null = null;
+    const db = new Database(dbPath, { readonly: true });
+
+    // Set busy timeout to avoid SQLITE_BUSY if Kiro IDE has the DB open.
     try {
-      // @ts-ignore - bun:sqlite is a Bun-only built-in; may not resolve under all TS versions
-      Database = (await import("bun:sqlite")).Database as SqliteDatabaseConstructor;
+      db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
     } catch {
-      try {
-        // @ts-expect-error - better-sqlite3 is an optional peer dependency
-        Database = (await import("better-sqlite3")).default as SqliteDatabaseConstructor;
-      } catch {
-        log.debug("No SQLite driver available (need bun:sqlite or better-sqlite3); trying sqlite3 CLI");
-      }
+      // Some SQLite drivers use exec instead of run
     }
 
-    if (Database) {
-      const db = new Database(dbPath, { readonly: true });
-
-      // Set busy timeout to avoid SQLITE_BUSY if Kiro IDE has the DB open.
-      try {
-        db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
-      } catch {
-        // Some SQLite drivers use exec instead of run
-      }
-
-      // Read auth_kv table
-      try {
-        const stmt = db.prepare("SELECT key, value FROM auth_kv");
-        rows = stmt.all() as AuthKvRow[];
-      } catch {
-        log.debug("Failed to read auth_kv table from Kiro DB");
-        try { db.close(); } catch { /* ignore */ }
-        return null;
-      }
-
-      // Try to read active profile ARN from state table
-      try {
-        const stateStmt = db.prepare("SELECT value FROM state WHERE key = ?");
-        const stateRow = stateStmt.get("api.codewhisperer.profile") as
-          | { value?: unknown }
-          | undefined;
-        const parsed = safeJsonParse(stateRow?.value);
-        const arn = parsed?.arn || parsed?.profileArn || parsed?.profile_arn;
-        if (typeof arn === "string" && arn.trim()) {
-          activeProfileArn = arn.trim();
-        }
-      } catch {
-        // State table might not exist — that's fine, tokens still work.
-      }
-
+    // Read auth_kv table
+    let rows: AuthKvRow[];
+    try {
+      const stmt = db.prepare("SELECT key, value FROM auth_kv");
+      rows = stmt.all() as AuthKvRow[];
+    } catch {
+      log.debug("Failed to read auth_kv table from Kiro DB");
       try { db.close(); } catch { /* ignore */ }
-    } else {
-      const snapshot = await readKiroDbWithSqliteCli(dbPath);
-      if (!snapshot) return null;
-      rows = snapshot.rows;
-      activeProfileArn = snapshot.activeProfileArn;
+      return null;
     }
+
+    // Try to read active profile ARN from state table
+    let activeProfileArn: string | undefined;
+    try {
+      const stateStmt = db.prepare("SELECT value FROM state WHERE key = ?");
+      const stateRow = stateStmt.get("api.codewhisperer.profile") as
+        | { value?: unknown }
+        | undefined;
+      const parsed = safeJsonParse(stateRow?.value);
+      const arn = parsed?.arn || parsed?.profileArn || parsed?.profile_arn;
+      if (typeof arn === "string" && arn.trim()) {
+        activeProfileArn = arn.trim();
+      }
+    } catch {
+      // State table might not exist — that's fine, tokens still work.
+    }
+
+    try { db.close(); } catch { /* ignore */ }
 
     // Extract device registration credentials (clientId/clientSecret)
     const deviceRegRow = rows.find(
@@ -594,26 +457,6 @@ export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
 }
 
 /**
- * Attempt to read credentials from Kiro IDE's local database WITHOUT checking
- * token expiry. This is the last-resort fallback: the access token is probably
- * stale, but the refresh token might still be valid for one more exchange.
- *
- * Returns null if the DB doesn't exist, is unreadable, or has no tokens at all.
- * Never throws.
- */
-export async function getKiroCliCredentialsAllowExpired(
-  exclude?: KiroCliCredentials | null,
-): Promise<KiroCliCredentials | null> {
-  // Delegate to the same DB reader — importFromKiroCli already returns
-  // whatever token is stored without validating expiry timestamps.
-  // This separate export exists so callers express intent ("I know the token
-  // may be expired, give it to me anyway") and future refactors can add
-  // expiry-gating to importFromKiroCli without breaking the fallback path.
-  const imported = await importFromKiroCli();
-  return sameKiroCliCredential(imported, exclude ?? null) ? null : imported;
-}
-
-/**
  * Write refreshed credentials back to Kiro CLI's local SQLite database.
  *
  * This enables bidirectional sync for credentials originally imported from the
@@ -636,50 +479,32 @@ export async function saveKiroCliCredentials(creds: KiroCliCredentials): Promise
   }
 
   try {
-    let Database: SqliteDatabaseConstructor | null = null;
+    const Database = await loadSqliteDriver();
+    if (!Database) return false;
+
+    // Open in read-write mode (no `readonly` flag).
+    const db = new Database(dbPath);
+
     try {
-      // @ts-ignore - bun:sqlite is a Bun-only built-in; may not resolve under all TS versions
-      Database = (await import("bun:sqlite")).Database as SqliteDatabaseConstructor;
+      db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
     } catch {
-      try {
-        // @ts-expect-error - better-sqlite3 is an optional peer dependency
-        Database = (await import("better-sqlite3")).default as SqliteDatabaseConstructor;
-      } catch {
-        log.debug("No SQLite driver available for credential write-back; trying sqlite3 CLI");
-      }
+      // Some SQLite drivers use exec instead of run
     }
 
     let rows: AuthKvRow[];
-    let db: SqliteDb | null = null;
-
-    if (Database) {
-      // Open in read-write mode (no `readonly` flag).
-      db = new Database(dbPath);
-
-      try {
-        db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
-      } catch {
-        // Some SQLite drivers use exec instead of run
-      }
-
-      try {
-        const stmt = db.prepare("SELECT key, value FROM auth_kv");
-        rows = stmt.all() as AuthKvRow[];
-      } catch {
-        log.debug("Failed to read auth_kv table for credential write-back");
-        try { db.close(); } catch { /* ignore */ }
-        return false;
-      }
-    } else {
-      const cliRows = await readKiroAuthKvRowsWithSqliteCli(dbPath);
-      if (!cliRows) return false;
-      rows = cliRows;
+    try {
+      const stmt = db.prepare("SELECT key, value FROM auth_kv");
+      rows = stmt.all() as AuthKvRow[];
+    } catch {
+      log.debug("Failed to read auth_kv table for credential write-back");
+      try { db.close(); } catch { /* ignore */ }
+      return false;
     }
 
     const tokenRow = selectKiroTokenRowForWrite(rows, creds);
     if (!tokenRow) {
       log.debug("No matching token entry found in auth_kv — cannot write back");
-      try { db?.close(); } catch { /* ignore */ }
+      try { db.close(); } catch { /* ignore */ }
       return false;
     }
 
@@ -692,23 +517,17 @@ export async function saveKiroCliCredentials(creds: KiroCliCredentials): Promise
       refreshToken: creds.refreshToken,
       refresh_token: creds.refreshToken,
     };
-    const updatedValue = JSON.stringify(updated);
 
-    if (db) {
-      try {
-        const updateStmt = db.prepare("UPDATE auth_kv SET value = ? WHERE key = ?");
-        updateStmt.run(updatedValue, tokenRow.key);
-      } catch (err) {
-        log.warn(`Failed to write credentials back to Kiro CLI DB: ${err}`);
-        try { db.close(); } catch { /* ignore */ }
-        return false;
-      }
-
+    try {
+      const updateStmt = db.prepare("UPDATE auth_kv SET value = ? WHERE key = ?");
+      updateStmt.run(JSON.stringify(updated), tokenRow.key);
+    } catch (err) {
+      log.warn(`Failed to write credentials back to Kiro CLI DB: ${err}`);
       try { db.close(); } catch { /* ignore */ }
-    } else {
-      const wrote = await writeKiroDbWithSqliteCli(dbPath, tokenRow.key, updatedValue);
-      if (!wrote) return false;
+      return false;
     }
+
+    try { db.close(); } catch { /* ignore */ }
 
     log.info("Wrote refreshed credentials back to Kiro CLI DB");
     return true;

@@ -8,9 +8,6 @@
 import type { AssistantMessage, AssistantMessageEventStream, TextContent, ThinkingContent } from "@earendil-works/pi-ai";
 import { log } from "./debug";
 
-export const THINKING_START_TAG = "<thinking>";
-export const THINKING_END_TAG = "</thinking>";
-
 const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
   { open: "<thinking>", close: "</thinking>" },
   { open: "<think>", close: "</think>" },
@@ -28,11 +25,7 @@ function trailingPrefixLength(text: string, tag: string): number {
 }
 
 function maxTrailingPrefixLength(text: string, tags: string[]): number {
-  let max = 0;
-  for (const tag of tags) {
-    max = Math.max(max, trailingPrefixLength(text, tag));
-  }
-  return max;
+  return Math.max(0, ...tags.map((tag) => trailingPrefixLength(text, tag)));
 }
 
 export class ThinkingTagParser {
@@ -42,7 +35,7 @@ export class ThinkingTagParser {
   private thinkingBlockIndex: number | null = null;
   private textBlockIndex: number | null = null;
   private lastTextBlockIndex: number | null = null;
-  private activeEndTag: string = THINKING_END_TAG;
+  private activeEndTag = "</thinking>";
 
   constructor(
     private output: AssistantMessage,

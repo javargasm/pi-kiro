@@ -7,23 +7,22 @@ import type {
   AssistantMessage,
   AssistantMessageEventStream,
   Context,
-  ImageContent,
   Model,
   SimpleStreamOptions,
   TextContent,
   ThinkingContent,
   ToolCall,
-  ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
+import { importFromKiroCli } from "./kiro-cli-sync";
 import { isPermanentError } from "./health";
 import type { KiroModel } from "./models";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createHash } from "node:crypto";
-import { kiroModels, resolveKiroModel, getCachedDynamicModels } from "./models";
+import { kiroModels, PI_TO_KIRO_EFFORT, resolveKiroModel, getCachedDynamicModels } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
-import { countTokens } from "./tokenizer";
 
 import {
   buildHistory,
@@ -39,22 +38,26 @@ import {
   type KiroToolSpec,
   type KiroUserInputMessage,
   normalizeMessages,
-  parseToolArgs,
-  toKiroToolUseId,
-  TOOL_RESULT_LIMIT,
-  truncate,
+  resolveContext,
+  toKiroAssistant,
+  toKiroToolResults,
 } from "./transform";
 import {
   COMPACTION_THRESHOLD_PCT,
+  kiroUserAgents,
   resolveOS,
   SYSTEM_SEED_ACK,
   SYSTEM_SEED_INSTRUCTION,
+  TOOL_PURPOSE_FIELD,
 } from "./kiro-defaults";
 
 // ---- Retry / timeout constants -----------------------------------------
 
 const FIRST_TOKEN_TIMEOUT_DEFAULT_MS = 90_000;
-const IDLE_TIMEOUT_MS = 60_000;
+// Conformance #43. Reasoning models (GPT-5.6 Sol, Opus at high effort) can go
+// minutes without a parsed event while they think; a shorter window kills the
+// turn mid-think on every retry.
+const IDLE_TIMEOUT_MS = 300_000;
 const MAX_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
 
@@ -93,19 +96,10 @@ function isTransientError(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-function findModel(modelId: string): { firstTokenTimeout?: number; idleTimeout?: number } | undefined {
-  return (
-    (kiroModels.find((x) => x.id === modelId) as KiroModel | undefined) ??
-    getCachedDynamicModels()?.find((x) => x.id === modelId)
-  );
-}
-
 export function firstTokenTimeoutForModel(modelId: string): number {
-  return findModel(modelId)?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
-}
-
-function idleTimeoutForModel(modelId: string): number {
-  return findModel(modelId)?.idleTimeout ?? IDLE_TIMEOUT_MS;
+  const def =
+    kiroModels.find((x) => x.id === modelId) ?? getCachedDynamicModels()?.find((x) => x.id === modelId);
+  return def?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
 }
 
 /**
@@ -186,21 +180,6 @@ function emitHiddenReasoningLate(
 		content: "",
 		partial: output,
 	});
-}
-
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(signal.reason);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      },
-      { once: true },
-    );
-  });
 }
 
 // ---- profileArn store ---------------------------------------------------
@@ -318,9 +297,10 @@ export function resolveConversationId(sessionId: string | undefined): string {
 
 export function streamKiro(
   model: Model<Api>,
-  context: Context,
+  rawContext: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  const context = resolveContext(rawContext);
   const stream = createAssistantMessageEventStream();
   (async () => {
     const output: AssistantMessage = {
@@ -349,9 +329,12 @@ export function streamKiro(
     // error path can cancel it, preventing a stray late shim from
     // firing after the stream ended.
     let hiddenShimTimer: ReturnType<typeof setTimeout> | null = null;
+    // Stream watchdog (first-token / idle). Hoisted for the same reason: a
+    // dropped socket makes read() throw straight to the catch below.
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
 
     try {
-      const accessToken = options?.apiKey;
+      let accessToken = options?.apiKey;
       if (!accessToken) {
         throw new Error("Kiro credentials not set. Run /login kiro.");
       }
@@ -425,11 +408,7 @@ export function streamKiro(
         // in history, causes Bedrock to expect a reasoningContent.signature on
         // the following assistant response — triggering THINKING_SIGNATURE_INVALID.
         // The thinking directive only belongs in the current message (or seed).
-        const {
-          history,
-          systemPrepended: _systemPrepended,
-          currentMsgStartIdx,
-        } = buildHistory(normalized, kiroModelId);
+        const { history, currentMsgStartIdx } = buildHistory(normalized);
 
         // Inject the synthetic system seed pair at the start of history.
         // The real Kiro CLI always sends this as the first history entries.
@@ -443,109 +422,30 @@ export function streamKiro(
         const currentMessages = normalized.slice(currentMsgStartIdx);
         const firstMsg = currentMessages[0];
         let currentContent = "";
-        const currentToolResults: KiroToolResult[] = [];
+        let currentToolResults: KiroToolResult[] = [];
         let currentImages: KiroImage[] | undefined;
 
-        if (firstMsg?.role === "assistant") {
-          const am = firstMsg;
-          let armContent = "";
-          let armReasoningText = "";
-          let armReasoningSignature = "";
-          const armToolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
-          if (Array.isArray(am.content)) {
-            for (const b of am.content) {
-              if (b.type === "text") {
-                armContent += (b as TextContent).text;
-              } else if (b.type === "thinking") {
-                // Accumulate thinking text + signature for the reasoningContent field.
-                const tb = b as unknown as { thinking: string; thinkingSignature?: string };
-                armReasoningText += tb.thinking;
-                if (tb.thinkingSignature) armReasoningSignature = tb.thinkingSignature;
-              } else if (b.type === "toolCall") {
-                const tc = b as ToolCall;
-                armToolUses.push({
-                  name: tc.name,
-                  toolUseId: toKiroToolUseId(tc.id),
-                  input: parseToolArgs(tc.arguments),
-                });
-              }
-            }
-          }
-          const hasReasoning = armReasoningText.length > 0;
-          if (armContent || armToolUses.length > 0 || hasReasoning) {
+        if (firstMsg?.role === "assistant" || firstMsg?.role === "toolResult") {
+          const arm = firstMsg.role === "assistant" ? toKiroAssistant(firstMsg) : null;
+          if (arm) {
             const last = history[history.length - 1];
-            // Only include reasoningContent when we have a valid signature.
-            const reasoningContent = hasReasoning && armReasoningSignature
-              ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
-              : undefined;
-            if (last && !last.userInputMessage && last.assistantResponseMessage) {
-              last.assistantResponseMessage.content += `\n\n${armContent}`;
-              if (armToolUses.length > 0) {
-                last.assistantResponseMessage.toolUses = [
-                  ...(last.assistantResponseMessage.toolUses ?? []),
-                  ...armToolUses,
-                ];
-              }
-              if (reasoningContent) {
-                last.assistantResponseMessage.reasoningContent = reasoningContent;
-              }
+            const lastArm = last && !last.userInputMessage ? last.assistantResponseMessage : undefined;
+            if (lastArm) {
+              lastArm.content += `\n\n${arm.content}`;
+              if (arm.toolUses) lastArm.toolUses = [...(lastArm.toolUses ?? []), ...arm.toolUses];
+              if (arm.reasoningContent) lastArm.reasoningContent = arm.reasoningContent;
             } else {
-              history.push({
-                assistantResponseMessage: {
-                  content: armContent,
-                  ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
-                  ...(reasoningContent ? { reasoningContent } : {}),
-                },
-              });
+              history.push({ assistantResponseMessage: arm });
             }
           }
-
-          const toolResultImages: ImageContent[] = [];
-          for (let i = 1; i < currentMessages.length; i++) {
-            const m = currentMessages[i];
-            if (m?.role === "toolResult") {
-              const trm = m as ToolResultMessage;
-              currentToolResults.push({
-                content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
-                status: trm.isError ? "error" : "success",
-                toolUseId: toKiroToolUseId(trm.toolCallId),
-              });
-              if (Array.isArray(trm.content)) {
-                for (const c of trm.content) {
-                  if (c.type === "image") toolResultImages.push(c as ImageContent);
-                }
-              }
-            }
-          }
-          if (toolResultImages.length > 0) {
-            const { images: converted, omitted } = convertImagesToKiro(toolResultImages);
+          const { toolResults, images } = toKiroToolResults(currentMessages);
+          currentToolResults = toolResults;
+          if (images.length > 0) {
+            const { images: converted, omitted } = convertImagesToKiro(images);
             if (omitted > 0) log.warn(`${omitted} tool-result image(s) omitted (size/count limit)`);
-            currentImages = currentImages ? [...currentImages, ...converted] : converted;
+            currentImages = converted;
           }
-          currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
-        } else if (firstMsg?.role === "toolResult") {
-          const toolResultImages: ImageContent[] = [];
-          for (const m of currentMessages) {
-            if (m?.role === "toolResult") {
-              const trm = m as ToolResultMessage;
-              currentToolResults.push({
-                content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
-                status: trm.isError ? "error" : "success",
-                toolUseId: toKiroToolUseId(trm.toolCallId),
-              });
-              if (Array.isArray(trm.content)) {
-                for (const c of trm.content) {
-                  if (c.type === "image") toolResultImages.push(c as ImageContent);
-                }
-              }
-            }
-          }
-          if (toolResultImages.length > 0) {
-            const { images: converted, omitted } = convertImagesToKiro(toolResultImages);
-            if (omitted > 0) log.warn(`${omitted} tool-result image(s) omitted (size/count limit)`);
-            currentImages = currentImages ? [...currentImages, ...converted] : converted;
-          }
-          currentContent = "Tool results provided.";
+          currentContent = toolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
         } else if (firstMsg?.role === "user") {
           currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
           if (systemPrompt) {
@@ -556,17 +456,10 @@ export function streamKiro(
         // Wrap content in the Kiro CLI format: context entry + user message.
         const now = new Date();
         const tzOffset = -now.getTimezoneOffset();
-        const tzSign = tzOffset >= 0 ? "+" : "-";
-        const tzH = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, "0");
-        const tzM = String(Math.abs(tzOffset) % 60).padStart(2, "0");
-        const isoLocal = now.getFullYear() + "-" +
-          String(now.getMonth() + 1).padStart(2, "0") + "-" +
-          String(now.getDate()).padStart(2, "0") + "T" +
-          String(now.getHours()).padStart(2, "0") + ":" +
-          String(now.getMinutes()).padStart(2, "0") + ":" +
-          String(now.getSeconds()).padStart(2, "0") + "." +
-          String(now.getMilliseconds()).padStart(3, "0") +
-          tzSign + tzH + ":" + tzM;
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const isoLocal =
+          new Date(now.getTime() + tzOffset * 60_000).toISOString().slice(0, -1) +
+          `${tzOffset >= 0 ? "+" : "-"}${pad(Math.floor(Math.abs(tzOffset) / 60))}:${pad(Math.abs(tzOffset) % 60)}`;
         const weekday = now.toLocaleDateString("en-US", { weekday: "long" });
         currentContent =
           `--- CONTEXT ENTRY BEGIN ---\n` +
@@ -618,13 +511,9 @@ export function streamKiro(
 
           uimc.tools = context.tools.map((t) => {
             const params = sanitizeSchema(t.parameters) as Record<string, unknown>;
-            // Bedrock / Amazon Q often expects __tool_use_purpose in properties.
-            // We'll inject it just in case it's a hard requirement, though it might not be.
+            // The real Kiro CLI appends __tool_use_purpose to every tool schema.
             if (params.properties && typeof params.properties === "object" && !Array.isArray(params.properties)) {
-              (params.properties as Record<string, unknown>).__tool_use_purpose = {
-                type: "string",
-                description: "A brief explanation why you are making this tool use.",
-              };
+              (params.properties as Record<string, unknown>).__tool_use_purpose = TOOL_PURPOSE_FIELD;
             }
             return {
               toolSpecification: {
@@ -676,24 +565,15 @@ export function streamKiro(
         };
 
         // Attach adaptive thinking effort when the model supports it.
-        // Pi has 5 levels (minimal…xhigh), Kiro has 5 (low…max).
-        // Pi's extra bottom level (`minimal`) means each maps one up.
-        const EFFORT_MAP: Record<string, string> = {
-          minimal: "low",
-          low: "medium",
-          medium: "high",
-          high: "xhigh",
-          xhigh: "max",
-        };
-        const staticModel = kiroModels.find((m) => m.id === model.id) as KiroModel | undefined;
+        const staticModel = kiroModels.find((m) => m.id === model.id);
         const dynamicModel = getCachedDynamicModels()?.find((m) => m.id === model.id);
         const supportedEfforts = staticModel?.supportedEfforts ?? dynamicModel?.supportedEfforts;
         const supportsThinkingConfig = staticModel?.supportsThinkingConfig ?? dynamicModel?.supportsThinkingConfig;
         
         if (supportedEfforts && supportedEfforts.length > 0 && options?.reasoning && typeof options.reasoning === "string") {
-          const kiroEffort = EFFORT_MAP[options.reasoning];
+          const kiroEffort = PI_TO_KIRO_EFFORT[options.reasoning];
           if (kiroEffort && supportedEfforts.includes(kiroEffort)) {
-            request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+            request.additionalModelRequestFields ??= {};
             request.additionalModelRequestFields.output_config = { effort: kiroEffort };
             log.debug("effort.set", { piReasoning: options.reasoning, kiroEffort, model: model.id });
           }
@@ -701,7 +581,7 @@ export function streamKiro(
 
         // Request the adaptive thinking block so that Kiro streams the reasoning text.
         if (supportsThinkingConfig && thinkingEnabled) {
-          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+          request.additionalModelRequestFields ??= {};
           request.additionalModelRequestFields.thinking = {
             type: "adaptive",
             display: "summarized",
@@ -720,7 +600,7 @@ export function streamKiro(
             Math.max(Math.floor(options.maxTokens), 1024),
             model.maxTokens || 64_000,
           );
-          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+          request.additionalModelRequestFields ??= {};
           request.additionalModelRequestFields.max_tokens = capped;
           log.debug("maxTokens.set", { maxTokens: capped, model: model.id });
         }
@@ -746,10 +626,8 @@ export function streamKiro(
         let capacityRetryCount = 0;
         let transientRetryCount = 0;
         let contextTruncationAttempt = 0;
+        let credentialResyncAttempted = false;
         while (true) {
-          const osName = resolveOS();
-          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI`;
-          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
 
           log.debug("request.send", {
@@ -773,8 +651,7 @@ export function streamKiro(
               "x-amzn-codewhisperer-optout": "true",
               "amz-sdk-invocation-id": crypto.randomUUID(),
               "amz-sdk-request": "attempt=1; max=3",
-              "user-agent": ua,
-              "x-amz-user-agent": xAmzUa,
+              ...kiroUserAgents("codewhispererstreaming", resolveOS()),
               Pragma: "no-cache",
               "Cache-Control": "no-cache",
             },
@@ -784,16 +661,33 @@ export function streamKiro(
 
           if (response.ok) break;
 
-          let errText = "";
-          try {
-            errText = await response.text();
-          } catch {
-            errText = "";
-          }
+          const errText = await response.text().catch(() => "");
           log.debug("response.error", {
             status: response.status,
             body: errText,
           });
+
+          if ((response.status === 401 || response.status === 403) && !credentialResyncAttempted) {
+            credentialResyncAttempted = true;
+            try {
+              log.info(
+                `authentication rejected (${response.status}) — resyncing Kiro CLI credentials and retrying once`,
+              );
+              const imported = await importFromKiroCli();
+              if (imported?.accessToken && imported.accessToken !== accessToken) {
+                accessToken = imported.accessToken;
+                if (imported.profileArn) {
+                  seedProfileArn(imported.profileArn);
+                  request.profileArn = imported.profileArn;
+                }
+                log.info("Kiro CLI credential resync succeeded — retrying request");
+                continue;
+              }
+              log.warn("Kiro CLI credential resync did not provide a new access token");
+            } catch (err) {
+              log.warn(`Kiro CLI credential resync failed: ${err}`);
+            }
+          }
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {
             capacityRetryCount++;
@@ -805,7 +699,7 @@ export function streamKiro(
             log.warn(
               `INSUFFICIENT_MODEL_CAPACITY — retrying in ${delayMs}ms (${capacityRetryCount}/${CAPACITY_MAX_RETRIES})`,
             );
-            await abortableDelay(delayMs, options?.signal);
+            await sleep(delayMs, undefined, { signal: options?.signal });
             continue;
           }
 
@@ -840,7 +734,7 @@ export function streamKiro(
               `transient error ${response.status} — retrying in ${delayMs}ms ` +
               `(${transientRetryCount}/${TRANSIENT_MAX_RETRIES})`,
             );
-            await abortableDelay(delayMs, options?.signal);
+            await sleep(delayMs, undefined, { signal: options?.signal });
             continue;
           }
           if (response.status === 401) {
@@ -915,57 +809,31 @@ export function streamKiro(
           }
         };
 
-        let idleTimer: ReturnType<typeof setTimeout> | null = null;
-        let idleCancelled = false;
-        const idleTimeoutMs = idleTimeoutForModel(model.id);
-        const resetIdle = () => {
-          if (idleTimer) clearTimeout(idleTimer);
-          idleTimer = setTimeout(() => {
-            idleCancelled = true;
-            void reader.cancel().catch(() => {});
-          }, idleTimeoutMs);
-        };
-
+        // One watchdog: the first-token window until the first read, then the
+        // idle window (re-armed on parsed events). Cancelling the reader
+        // resolves the pending read with done, which ends the loop.
+        watchdog = null;
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
+        let idleCancelled = false;
+        const armWatchdog = (ms: number) => {
+          if (watchdog) clearTimeout(watchdog);
+          watchdog = setTimeout(() => {
+            if (gotFirstToken) idleCancelled = true;
+            else firstTokenTimedOut = true;
+            void reader.cancel().catch(() => {});
+          }, ms);
+        };
+        armWatchdog(firstTokenTimeoutForModel(model.id));
         let streamError: string | null = null;
-        const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
-        type ReadResult = { done: boolean; value?: Uint8Array };
 
         while (true) {
-          let readResult: ReadResult;
-          if (!gotFirstToken) {
-            const readPromise = reader.read() as Promise<ReadResult>;
-            let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
-            const result = await Promise.race([
-              readPromise,
-              new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
-                firstTokenTimer = setTimeout(
-                  () => resolve(FIRST_TOKEN_SENTINEL),
-                  firstTokenTimeoutForModel(model.id),
-                );
-              }),
-            ]);
-            // Always clear the timer — otherwise the happy path keeps the
-            // event loop alive for firstTokenTimeout ms after the stream
-            // ends, which for opus-4-7 (180s) is user-visible as a hang
-            // before a short-lived CLI exits.
-            if (firstTokenTimer) clearTimeout(firstTokenTimer);
-            if (result === FIRST_TOKEN_SENTINEL) {
-              readPromise.catch(() => {});
-              void reader.cancel().catch(() => {});
-              firstTokenTimedOut = true;
-              break;
-            }
-            readResult = result as ReadResult;
-            gotFirstToken = true;
-            resetIdle();
-          } else {
-            readResult = (await reader.read()) as ReadResult;
-          }
-
-          const { done, value } = readResult;
+          const { done, value } = await reader.read();
           if (done) break;
+          if (!gotFirstToken) {
+            gotFirstToken = true;
+            armWatchdog(IDLE_TIMEOUT_MS);
+          }
           const decoded = decoder.decode(value, { stream: true });
           buffer += decoded;
           if (log.isDebug()) {
@@ -985,7 +853,7 @@ export function streamKiro(
           // idle timeout from firing. Without this guard, the API's
           // keepalive framing resets the timer on every chunk, causing
           // potentially infinite stream hangs.
-          if (events.length > 0) resetIdle();
+          if (events.length > 0) armWatchdog(IDLE_TIMEOUT_MS);
 
           if (log.isDebug() && events.length > 0) {
             for (const ev of events) {
@@ -1111,7 +979,9 @@ export function streamKiro(
           }
         }
 
-        if (idleTimer) clearTimeout(idleTimer);
+        // Always clear — a pending 180s first-token timer would otherwise keep
+        // a short-lived CLI alive after the stream ends.
+        if (watchdog) clearTimeout(watchdog);
 
         if (firstTokenTimedOut || idleCancelled || streamError) {
           // Once any output reached the consumer, a reset-and-retry would
@@ -1131,7 +1001,7 @@ export function streamKiro(
             // HIDDEN_REASONING_COUNTDOWN_MS). The retry re-arms a
             // fresh timer on the next `start`.
             cancelHiddenShim();
-            await abortableDelay(delayMs, options?.signal);
+            await sleep(delayMs, undefined, { signal: options?.signal });
             // Safe to reset — nothing was emitted to the consumer yet.
             output.content = [];
             textBlockIndex = null;
@@ -1185,7 +1055,7 @@ export function streamKiro(
         }
 
         if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
-        output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
+        output.usage.output = usageEvent?.outputTokens ?? Math.ceil(totalContent.length / 4); // ~4 chars/token
         output.usage.totalTokens = output.usage.input + output.usage.output;
         try {
           calculateCost(model, output.usage);
@@ -1208,7 +1078,7 @@ export function streamKiro(
             cancelHiddenShim();
             output.content = [];
             textBlockIndex = null;
-            await abortableDelay(delayMs, options?.signal);
+            await sleep(delayMs, undefined, { signal: options?.signal });
             continue;
           }
           log.warn(`empty response persisted after ${MAX_RETRIES} retries`);
@@ -1251,7 +1121,13 @@ export function streamKiro(
     } catch (error) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
+      // Node's fetch reports transport failures as a bare "fetch failed" /
+      // "terminated"; the socket code (ETIMEDOUT, ECONNRESET, ...) lives in
+      // `cause`. Keep the original text first so pi's retry patterns match.
+      const causeCode = error instanceof Error ? (error.cause as { code?: unknown } | undefined)?.code : undefined;
+      if (typeof causeCode === "string") output.errorMessage += ` (${causeCode})`;
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
+      if (watchdog) clearTimeout(watchdog);
       // Cancel the pending shim timer so no stray shim fires after
       // the error event. Nothing to close — the shim is self-
       // contained when it fires, and if the timer is still armed

@@ -28,11 +28,11 @@ import type {
 } from "@earendil-works/pi-ai";
 import {
   buildModelsFromApi,
-  dotToDash,
   fetchAvailableModels,
   filterModelsByRegion,
   getCachedDynamicModels,
   kiroModels,
+  PI_TO_KIRO_EFFORT,
   readModelDiskCache,
   resolveApiRegion,
   resolveProfileArn,
@@ -63,7 +63,6 @@ interface ProviderModelConfig {
   headers?: Record<string, string>;
   compat?: Model<Api>["compat"];
   firstTokenTimeout?: number;
-  idleTimeout?: number;
   reasoningHidden?: boolean;
   thinkingLevelMap?: Partial<Record<string, string | null>>;
 }
@@ -91,20 +90,15 @@ interface ProviderConfig {
 
 interface ExtensionAPI {
   registerProvider(name: string, config: ProviderConfig): void;
-  on(event: string, handler: (event: unknown, ctx: unknown) => void | Promise<void>): void;
-  setModel(model: unknown): Promise<boolean>;
 }
 
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+const AUTO_MODEL: KiroModelDef = kiroModels.find((model) => model.id === "auto")!;
 
-/** Pi → Kiro effort mapping. Exposes all 5 Pi thinking levels. */
-const KIRO_THINKING_LEVEL_MAP: Partial<Record<string, string | null>> = {
-  minimal: "low",
-  low: "medium",
-  medium: "high",
-  high: "xhigh",
-  xhigh: "max",
-};
+/** Keep Auto available while an older disk cache is refreshed. */
+function withAutoModel(models: readonly KiroModelDef[]): KiroModelDef[] {
+  return models.some((model) => model.id === "auto") ? [...models] : [...models, AUTO_MODEL];
+}
 
 function toProviderModels(defs: readonly KiroModelDef[]): ProviderModelConfig[] {
   return defs.map((d) => ({
@@ -116,11 +110,10 @@ function toProviderModels(defs: readonly KiroModelDef[]): ProviderModelConfig[] 
     contextWindow: d.contextWindow,
     maxTokens: d.maxTokens,
     firstTokenTimeout: d.firstTokenTimeout,
-    idleTimeout: d.idleTimeout,
     ...(d.reasoningHidden ? { reasoningHidden: d.reasoningHidden } : {}),
     ...(d.reasoning
       ? {
-          thinkingLevelMap: KIRO_THINKING_LEVEL_MAP,
+          thinkingLevelMap: PI_TO_KIRO_EFFORT,
           compat: { forceAdaptiveThinking: true },
         }
       : {}),
@@ -221,11 +214,12 @@ function writeKiroCredentialsPartial(fields: Record<string, unknown>): void {
 export default async function (pi: ExtensionAPI): Promise<void> {
   // --- Fast path: load disk-cached models immediately, no network ---
   // `kiroModels` (KiroModel[]) is structurally a superset of KiroModelDef.
-  let modelDefs = toProviderModels(kiroModels);
+  let modelDefs = toProviderModels(withAutoModel(kiroModels));
   const diskCached = readModelDiskCache();
   if (diskCached && diskCached.length > 0) {
-    setCachedDynamicModels(diskCached);
-    modelDefs = toProviderModels(diskCached);
+    const cachedModels = withAutoModel(diskCached);
+    setCachedDynamicModels(cachedModels);
+    modelDefs = toProviderModels(cachedModels);
     log.info(`Loaded ${modelDefs.length} models from disk cache (fast path)`);
   }
 
@@ -237,29 +231,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     seedProfileArn(credsEager.profileArn);
     log.info(`Seeded profileArn from stored credentials: ${credsEager.profileArn}`);
   }
-
-  // --- session_start: apply chat.defaultModel from ~/.kiro/settings/cli.json ---
-  pi.on("session_start", async (_event: unknown, _ctx: unknown) => {
-    try {
-      const ctx = _ctx as { modelRegistry: { find(provider: string, id: string): unknown }; model?: { id: string } };
-      const kiroCliSettingsPath = join(homedir(), ".kiro", "settings", "cli.json");
-      if (!existsSync(kiroCliSettingsPath)) return;
-      const kiroSettings = JSON.parse(readFileSync(kiroCliSettingsPath, "utf-8")) as Record<string, string>;
-      const dotModelId = kiroSettings["chat.defaultModel"]?.trim();
-      if (!dotModelId) return;
-      // Kiro CLI uses dot notation (claude-sonnet-4.6), pi uses dash (claude-sonnet-4-6)
-      const dashModelId = dotToDash(dotModelId);
-      const model = ctx.modelRegistry.find("kiro", dashModelId);
-      if (model) {
-        await pi.setModel(model);
-        log.info(`session_start: applied kiro default model: ${dashModelId}`);
-      } else {
-        log.warn(`session_start: kiro default model "${dashModelId}" not in registry`);
-      }
-    } catch (err) {
-      log.warn(`session_start: failed to apply kiro default model: ${err}`);
-    }
-  });
 
   // Register provider immediately — no awaiting network
   pi.registerProvider("kiro", {
@@ -295,8 +266,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         const dynamicDefs = getCachedDynamicModels();
         const kiroModelsToRegister: Model<Api>[] =
           dynamicDefs && dynamicDefs.length > 0
-            ? toProviderModels(dynamicDefs).map(toKiroModel)
-            : filterModelsByRegion(toProviderModels(kiroModels).map(toKiroModel), apiRegion);
+            ? toProviderModels(withAutoModel(dynamicDefs)).map(toKiroModel)
+            : filterModelsByRegion(toProviderModels(withAutoModel(kiroModels)).map(toKiroModel), apiRegion);
 
         return [...nonKiro, ...kiroModelsToRegister];
       },

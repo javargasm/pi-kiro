@@ -9,29 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { log } from "./debug";
-
-/** Canonical Kiro API IDs (dot form) accepted by the server. */
-export const KIRO_MODEL_IDS = new Set<string>([
-  "claude-fable-5",
-  "claude-opus-4.8",
-  "claude-opus-4.7",
-  "claude-opus-4.6",
-  "claude-sonnet-5",
-  "claude-sonnet-4.6",
-  "claude-opus-4.5",
-  "claude-sonnet-4.5",
-  "claude-sonnet-4",
-  "claude-haiku-4.5",
-  "minimax-m2.1",
-  "minimax-m2.5",
-  "glm-5",
-  "deepseek-3.2",
-  "qwen3-coder-next",
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "auto",
-]);
+import { kiroUserAgents } from "./kiro-defaults";
 
 /** Convert pi's dash form to the Kiro API's dot form (e.g. 4-6 → 4.6). */
 export function dashToDot(modelId: string): string {
@@ -43,10 +21,15 @@ export function dotToDash(modelId: string): string {
   return modelId.replace(/(\d)\.(\d)/g, "$1-$2");
 }
 
-/** Convert pi's dash form to the Kiro API's dot form (e.g. 4-6 → 4.6). */
+/**
+ * Convert pi's dash form to the Kiro API's dot form (e.g. 4-6 → 4.6).
+ * Accepts the static catalog plus anything the dynamic catalog advertises
+ * (live ListAvailableModels or the disk cache), so newly launched Kiro
+ * models work without a code change.
+ */
 export function resolveKiroModel(modelId: string): string {
   const kiroId = dashToDot(modelId);
-  if (!KIRO_MODEL_IDS.has(kiroId)) {
+  if (!KIRO_MODEL_IDS.has(kiroId) && !getCachedDynamicModels()?.some((m) => m.id === modelId)) {
     throw new Error(`Unknown Kiro model ID: ${modelId}`);
   }
   return kiroId;
@@ -85,69 +68,6 @@ export function resolveApiRegion(ssoRegion: string | undefined): string {
   return API_REGION_MAP[ssoRegion] ?? ssoRegion;
 }
 
-/**
- * Models available per API region (allowlist). Unknown regions return an
- * empty list — update this map when Kiro launches in a new region.
- * Source: https://kiro.dev/docs/cli/models/
- */
-const MODELS_BY_REGION: Record<string, Set<string>> = {
-  "us-east-1": new Set([
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "minimax-m2-1",
-    "minimax-m2-5",
-    "glm-5",
-    "deepseek-3-2",
-    "qwen3-coder-next",
-    "gpt-5-6-sol",
-    "gpt-5-6-terra",
-    "gpt-5-6-luna",
-    "auto",
-  ]),
-  "eu-central-1": new Set([
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "minimax-m2-1",
-    "minimax-m2-5",
-    "glm-5",
-    "qwen3-coder-next",
-    "gpt-5-6-sol",
-    "gpt-5-6-terra",
-    "gpt-5-6-luna",
-    "auto",
-  ]),
-};
-
-export function filterModelsByRegion<T extends { id: string }>(
-  models: T[],
-  apiRegion: string,
-): T[] {
-  const allowed = MODELS_BY_REGION[apiRegion];
-  if (!allowed) {
-    console.warn(
-      `[pi-kiro] Unknown API region "${apiRegion}" — no models available. Update MODELS_BY_REGION in models.ts.`,
-    );
-    return [];
-  }
-  return models.filter((m) => allowed.has(m.id));
-}
-
 /** Runtime endpoint per API region. Kiro CLI 2.5+ migrated from amazonaws.com to kiro.dev. */
 const RUNTIME_ENDPOINTS: Record<string, string> = {
   "us-east-1": "https://runtime.us-east-1.kiro.dev",
@@ -173,21 +93,15 @@ type Input = ("text" | "image")[];
 const MULTIMODAL: Input = ["text", "image"];
 const TEXT_ONLY: Input = ["text"];
 
-export interface KiroModel {
+export interface KiroModelDef {
   id: string;
   name: string;
-  api: "kiro-api";
-  provider: "kiro";
-  baseUrl: string;
   reasoning: boolean;
   input: Input;
-  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
   contextWindow: number;
   maxTokens: number;
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
-  /** Per-model idle timeout override (ms). */
-  idleTimeout?: number;
   /**
    * Upstream is expected to hide reasoning from clients — tags and
    * native reasoning events should be absent. When set:
@@ -223,6 +137,25 @@ export interface KiroModel {
   supportsThinkingConfig?: boolean;
 }
 
+/**
+ * Pi → Kiro adaptive-thinking effort. Pi has 5 levels (minimal…xhigh), Kiro
+ * has 5 (low…max); pi's extra bottom level means each maps one up.
+ */
+export const PI_TO_KIRO_EFFORT: Record<string, string> = {
+  minimal: "low",
+  low: "medium",
+  medium: "high",
+  high: "xhigh",
+  xhigh: "max",
+};
+
+export interface KiroModel extends KiroModelDef {
+  api: "kiro-api";
+  provider: "kiro";
+  baseUrl: string;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+}
+
 export const kiroModels: KiroModel[] = [
   {
     ...KIRO_DEFAULTS,
@@ -233,7 +166,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
-    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -246,7 +178,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
-    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -259,7 +190,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
-    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -330,7 +260,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 64_000,
     firstTokenTimeout: 90_000,
-    idleTimeout: 60_000,
     supportedEfforts: ["low", "medium", "high", "max"],
     supportsThinkingConfig: true,
   },
@@ -388,7 +317,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 272_000,
     maxTokens: 64_000,
     firstTokenTimeout: 90_000,
-    idleTimeout: 60_000,
   },
   {
     ...KIRO_DEFAULTS,
@@ -399,7 +327,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 272_000,
     maxTokens: 64_000,
     firstTokenTimeout: 90_000,
-    idleTimeout: 60_000,
   },
   {
     ...KIRO_DEFAULTS,
@@ -410,7 +337,6 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 272_000,
     maxTokens: 64_000,
     firstTokenTimeout: 90_000,
-    idleTimeout: 60_000,
   },
   {
     ...KIRO_DEFAULTS,
@@ -423,7 +349,38 @@ export const kiroModels: KiroModel[] = [
   },
 ];
 
+/** Canonical Kiro API IDs (dot form) of the static catalog. */
+export const KIRO_MODEL_IDS = new Set(kiroModels.map((m) => dashToDot(m.id)));
+
+/**
+ * Static-catalog models per API region (fallback when the dynamic catalog is
+ * unavailable). Unknown regions return an empty list — update this map when
+ * Kiro launches in a new region. Source: https://kiro.dev/docs/cli/models/
+ */
+const STATIC_IDS = kiroModels.map((m) => m.id);
+const MODELS_BY_REGION: Record<string, Set<string>> = {
+  "us-east-1": new Set(STATIC_IDS),
+  "eu-central-1": new Set(STATIC_IDS.filter((id) => id !== "deepseek-3-2")),
+};
+
+export function filterModelsByRegion<T extends { id: string }>(
+  models: T[],
+  apiRegion: string,
+): T[] {
+  const allowed = MODELS_BY_REGION[apiRegion];
+  if (!allowed) {
+    console.warn(
+      `[pi-kiro] Unknown API region "${apiRegion}" — no models available. Update MODELS_BY_REGION in models.ts.`,
+    );
+    return [];
+  }
+  return models.filter((m) => allowed.has(m.id));
+}
+
 // ---- Dynamic model resolution -----------------------------------------
+
+/** Captured management-API user agents (the real CLI reports os/macos here). */
+const RUNTIME_UA = kiroUserAgents("codewhispererruntime", "macos");
 
 export interface KiroApiModel {
   modelId: string;
@@ -454,7 +411,7 @@ export async function resolveProfileArn(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/x-amz-json-1.0",
       "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
-      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI",
+      "user-agent": RUNTIME_UA["user-agent"],
     },
     body: "{}",
   });
@@ -470,8 +427,6 @@ export async function resolveProfileArn(
 
 /**
  * Fetch the list of models actually available for this account from Kiro.
- * Filters out "auto" — it appears in ListAvailableModels but is rejected
- * by GenerateAssistantResponse with INVALID_MODEL_ID.
  */
 export async function fetchAvailableModels(
   accessToken: string,
@@ -486,8 +441,7 @@ export async function fetchAvailableModels(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/x-amz-json-1.0",
       "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableModels",
-      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI",
-      "x-amz-user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
+      ...RUNTIME_UA,
       "x-amzn-codewhisperer-optout": "true",
       "amz-sdk-request": "attempt=1; max=3",
       "amz-sdk-invocation-id": crypto.randomUUID(),
@@ -506,7 +460,7 @@ export async function fetchAvailableModels(
     throw new Error(`ListAvailableModels failed: HTTP ${resp.status} - ${body}`);
   }
   const data = (await resp.json()) as { models?: KiroApiModel[] };
-  return (data.models ?? []).filter((m) => m.modelId !== "auto");
+  return data.models ?? [];
 }
 
 /** Model families known to support reasoning/thinking. */
@@ -528,34 +482,9 @@ function modelTimeout(dotId: string, defaultMs: number): number {
   return defaultMs;
 }
 
-export interface KiroModelDef {
-  id: string;
-  name: string;
-  reasoning: boolean;
-  input: ("text" | "image")[];
-  contextWindow: number;
-  maxTokens: number;
-  firstTokenTimeout?: number;
-  idleTimeout?: number;
-  reasoningHidden?: boolean;
-  supportedEfforts?: string[];
-  supportsThinkingConfig?: boolean;
-}
-
-/**
- * Build pi model definitions from the Kiro ListAvailableModels API response.
- *
- * BY DESIGN: this also mutates the module-level KIRO_MODEL_IDS set (adds each
- * dynamic model id) so resolveKiroModel() accepts ids that only exist in the
- * dynamic catalog. The side effect is intentional and required — without it,
- * dynamically-discovered models would be rejected as "Unknown Kiro model ID"
- * before the request is ever sent.
- */
+/** Build pi model definitions from the Kiro ListAvailableModels API response. */
 export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModelDef[] {
   return apiModels.map((m) => {
-    // Register the model ID dynamically to allow resolveKiroModel to pass
-    KIRO_MODEL_IDS.add(m.modelId);
-
     const dashId = dotToDash(m.modelId);
     const supportedTypes = m.supportedInputTypes ?? ["TEXT"];
     const input: ("text" | "image")[] = supportedTypes.includes("IMAGE")
@@ -579,7 +508,6 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModelDef[] {
       contextWindow: m.tokenLimits?.maxInputTokens ?? 200_000,
       maxTokens: m.tokenLimits?.maxOutputTokens ?? 8_192,
       firstTokenTimeout: modelTimeout(m.modelId, 90_000),
-      idleTimeout: modelTimeout(m.modelId, 60_000),
       // Per-model overrides for known special cases
       ...(supportedEfforts ? { supportedEfforts } : {}),
       ...(supportsThinkingConfig ? { supportsThinkingConfig } : {}),

@@ -39,9 +39,8 @@ indistinguishable from the real Kiro CLI and to smooth the login UX:
 - **`kiro-cli-sync.ts`** — optional zero-friction login. Primary read is
   the kiro-cli SQLite DB at `data.sqlite3` in the platform's standard
   data directory; that gives us the OIDC clientId/secret for proper OIDC
-  refresh. DB access tries `bun:sqlite`, optional `better-sqlite3`, then
-  the system `sqlite3` CLI so Node-based pi runtimes can still read/write
-  the DB without a native package. Fallback when the DB is
+  refresh. DB access uses `bun:sqlite`, else Node's built-in `node:sqlite`
+  (Node >= 22.13), so no native package is needed. Fallback when the DB is
   missing/locked/unreadable is the AWS SSO OIDC cache JSON at
   `~/.aws/sso/cache/kiro-auth-token.json` (the file Kiro IDE writes);
   that has tokens + region but no OIDC creds, so the resulting credential
@@ -82,7 +81,6 @@ pi-kiro/
 │   ├── event-parser.ts     (3) Kiro JSON frame extractor.
 │   ├── thinking-parser.ts  (3) Splits inline <thinking> tags into
 │   │                       structured ThinkingContent blocks.
-│   ├── tokenizer.ts        ~4-chars/token heuristic when usage event absent.
 │   ├── health.ts           Permanent-vs-retryable error classification.
 │   └── debug.ts            Leveled logger gated by KIRO_LOG.
 └── test/
@@ -219,12 +217,12 @@ src/extension.ts
 
 src/stream.ts (largest module)
     ├── imports: models, transform, event-parser, thinking-parser,
-    │            tokenizer, kiro-defaults, kiro-tools, debug,
+    │            kiro-defaults, kiro-tools, debug,
     │            pi-ai types + helpers
     └── no imports from: oauth (decoupled — token arrives via options.apiKey)
 
 src/oauth.ts
-    └── imports: debug, health — pure AWS SSO-OIDC otherwise
+    └── imports: debug, models — pure AWS SSO-OIDC otherwise
 
 src/kiro-cli-sync.ts
     └── imports: debug — readonly SQLite access otherwise
@@ -238,8 +236,8 @@ src/kiro-tools.ts
 src/thinking-parser.ts + src/event-parser.ts
     └── imports: pi-ai types only (self-contained parsers)
 
-src/health.ts + src/tokenizer.ts
-    └── no internal imports (leaf utilities)
+src/health.ts
+    └── no internal imports (leaf utility)
 ```
 
 Low coupling. `stream.ts` is the only module that imports broadly; that's

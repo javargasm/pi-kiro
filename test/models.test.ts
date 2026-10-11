@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   filterModelsByRegion,
   KIRO_MODEL_IDS,
   kiroModels,
   resolveApiRegion,
   resolveKiroModel,
+  setCachedDynamicModels,
 } from "../src/models";
 
 describe("resolveKiroModel", () => {
@@ -23,10 +24,43 @@ describe("resolveKiroModel", () => {
     expect(() => resolveKiroModel("gpt-4")).toThrow(/Unknown Kiro model ID/);
   });
 
+  // Conformance #2: IDs only the dynamic catalog knows (new Kiro launches,
+  // loaded from the disk cache with no API fetch) must still resolve.
+  it("accepts IDs from the dynamic catalog", () => {
+    setCachedDynamicModels([
+      { id: "claude-sonnet-9-9", name: "Future", reasoning: true, input: ["text"], contextWindow: 1, maxTokens: 1 },
+    ]);
+    try {
+      expect(resolveKiroModel("claude-sonnet-9-9")).toBe("claude-sonnet-9.9");
+    } finally {
+      setCachedDynamicModels(null);
+    }
+    expect(() => resolveKiroModel("claude-sonnet-9-9")).toThrow(/Unknown Kiro model ID/);
+  });
+
   it("every kiroModels entry resolves to a known Kiro ID", () => {
     for (const m of kiroModels) {
       expect(() => resolveKiroModel(m.id)).not.toThrow();
       expect(KIRO_MODEL_IDS.has(resolveKiroModel(m.id))).toBe(true);
+    }
+  });
+});
+
+describe("dynamic model catalog", () => {
+  it("preserves auto when Kiro advertises it", async () => {
+    const { fetchAvailableModels } = await import("../src/models");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ models: [{ modelId: "auto", modelName: "Auto" }] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      await expect(fetchAvailableModels("token", "us-east-1", "arn")).resolves.toEqual([
+        { modelId: "auto", modelName: "Auto" },
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });
@@ -93,18 +127,5 @@ describe("kiroModels catalog", () => {
   it("has no duplicate IDs", () => {
     const ids = kiroModels.map((m) => m.id);
     expect(new Set(ids).size).toBe(ids.length);
-  });
-
-  it("high-effort reasoning models get an extended idle timeout", () => {
-    // These models can sit silent (no parsed event) for long stretches
-    // while deliberating at high/xhigh effort. A tight idle window trips
-    // mid-think; the idle window must be at least as generous as the
-    // first-token window for them.
-    for (const id of ["claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"]) {
-      const m = kiroModels.find((x) => x.id === id);
-      expect(m, `missing model ${id}`).toBeDefined();
-      expect(m?.idleTimeout).toBe(180_000);
-      expect(m?.idleTimeout ?? 0).toBeGreaterThanOrEqual(m?.firstTokenTimeout ?? 0);
-    }
   });
 });

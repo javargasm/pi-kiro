@@ -8,6 +8,13 @@ import type {
   UserMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../src/kiro-cli-sync", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/kiro-cli-sync")>()),
+  importFromKiroCli: vi.fn(),
+}));
+
+import { importFromKiroCli } from "../src/kiro-cli-sync";
 import {
   HIDDEN_REASONING_COUNTDOWN_MS,
   resetProfileArnCache,
@@ -119,6 +126,8 @@ function mockFetchOk(body: string) {
 
 describe("streamKiro", () => {
   beforeEach(() => {
+    vi.mocked(importFromKiroCli).mockReset();
+    vi.mocked(importFromKiroCli).mockResolvedValue(null);
     resetProfileArnCache();
     // Seed a test profileArn for the default model endpoint so the
     // required-profileArn guard in streamKiro doesn't short-circuit.
@@ -173,6 +182,114 @@ describe("streamKiro", () => {
     expect(opts.headers["amz-sdk-request"]).toBe("attempt=1; max=3");
     expect(opts.headers.Pragma).toBe("no-cache");
     expect(opts.headers["Cache-Control"]).toBe("no-cache");
+  });
+
+  it.each([401, 403])(
+    "resyncs a changed Kiro CLI token and retries once after HTTP %i",
+    async (status) => {
+      vi.mocked(importFromKiroCli).mockResolvedValue({
+        accessToken: "fresh-token",
+        refreshToken: "refresh-token",
+        region: "us-east-1",
+        authMethod: "idc",
+        profileArn: "arn:aws:codewhisperer:us-east-1:000000000000:profile/fresh",
+      });
+      const success = {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: new TextEncoder().encode('{"content":"Recovered"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+          }),
+        },
+      };
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status,
+          statusText: "Rejected",
+          text: () => Promise.resolve("invalid bearer token"),
+        })
+        .mockResolvedValueOnce(success);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events = await collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }),
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(importFromKiroCli)).toHaveBeenCalledOnce();
+      expect(fetchMock.mock.calls[0]?.[1]?.headers.Authorization).toBe("Bearer stale-token");
+      expect(fetchMock.mock.calls[1]?.[1]?.headers.Authorization).toBe("Bearer fresh-token");
+      const retriedBody = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string);
+      expect(retriedBody.profileArn).toBe(
+        "arn:aws:codewhisperer:us-east-1:000000000000:profile/fresh",
+      );
+      expect(events.some((event) => event.type === "done")).toBe(true);
+    },
+  );
+
+  it("does not retry when the Kiro CLI DB has the same access token", async () => {
+    vi.mocked(importFromKiroCli).mockResolvedValue({
+      accessToken: "unchanged-token",
+      refreshToken: "refresh-token",
+      region: "us-east-1",
+      authMethod: "idc",
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+      text: () => Promise.resolve("invalid bearer token"),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = await collect(
+      streamKiro(makeModel(), makeContext(), { apiKey: "unchanged-token" }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.mocked(importFromKiroCli)).toHaveBeenCalledOnce();
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type).toBe("error");
+    if (error?.type === "error") {
+      expect(error.error.errorMessage).toContain("401 Unauthorized");
+    }
+  });
+
+  it("does not resync more than once when the retry also receives a 403", async () => {
+    vi.mocked(importFromKiroCli).mockResolvedValue({
+      accessToken: "fresh-token",
+      refreshToken: "refresh-token",
+      region: "us-east-1",
+      authMethod: "idc",
+    });
+    const rejected = {
+      ok: false,
+      status: 403,
+      statusText: "Forbidden",
+      text: () => Promise.resolve("invalid bearer token"),
+    };
+    const fetchMock = vi.fn().mockResolvedValue(rejected);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = await collect(
+      streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(importFromKiroCli)).toHaveBeenCalledOnce();
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type).toBe("error");
+    if (error?.type === "error") {
+      expect(error.error.errorMessage).toContain("run /login kiro");
+    }
   });
 
   it("canonicalizes current-turn tool IDs before sending to Kiro", async () => {
@@ -1278,6 +1395,112 @@ describe("firstTokenTimeoutForModel (consults dynamic models)", () => {
       } as KiroModelDef,
     ]);
     expect(firstTokenTimeoutForModel("dyn-opus")).toBe(180_000);
+  });
+});
+
+// Conformance #43: after the first frame arrives, a reasoning model can sit
+// silent for minutes while it thinks (no parsed events). The idle window must
+// outlast that, or the turn is killed and retried mid-think on every attempt.
+describe("idle timeout", () => {
+  /** Reader that sends one non-event frame, then stays silent for `silenceMs`
+   *  (forever if null) before replying. `cancel()` ends the pending read. */
+  function silentReader(silenceMs: number | null) {
+    const enc = new TextEncoder();
+    let step = 0;
+    let wake: ((r: { done: boolean; value?: Uint8Array }) => void) | undefined;
+    return {
+      read: () => {
+        step++;
+        if (step === 1) return Promise.resolve({ done: false, value: enc.encode(":event-type initial-response") });
+        if (step === 2) {
+          return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+            wake = resolve;
+            if (silenceMs !== null) {
+              setTimeout(
+                () => resolve({ done: false, value: enc.encode('{"content":"Hi"}{"contextUsagePercentage":5}') }),
+                silenceMs,
+              );
+            }
+          });
+        }
+        return Promise.resolve({ done: true, value: undefined });
+      },
+      cancel: vi.fn(() => {
+        wake?.({ done: true, value: undefined });
+        return Promise.resolve();
+      }),
+    };
+  }
+
+  function okResponse(reader: ReturnType<typeof silentReader>) {
+    return { ok: true, body: { getReader: () => reader } };
+  }
+
+  beforeEach(() => {
+    resetProfileArnCache();
+    seedProfileArn("arn:aws:codewhisperer:us-east-1:000000000000:profile/test");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("waits out a 4-minute silent reasoning gap without retrying", async () => {
+    const reader = silentReader(240_000);
+    const fetchMock = vi.fn().mockResolvedValue(okResponse(reader));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = collect(streamKiro(makeModel({ id: "gpt-5-6-sol" }), makeContext(), { apiKey: "tok" }));
+    await vi.advanceTimersByTimeAsync(240_000);
+    expect(reader.cancel).not.toHaveBeenCalled();
+    const events = await pending;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") expect(done.message.content).toEqual([{ type: "text", text: "Hi" }]);
+  });
+
+  it("still cancels and retries a stream that stays silent past 300s", async () => {
+    const stalled = silentReader(null);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(okResponse(stalled))
+      .mockResolvedValueOnce(okResponse(silentReader(0)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = collect(streamKiro(makeModel({ id: "gpt-5-6-sol" }), makeContext(), { apiKey: "tok" }));
+    await vi.advanceTimersByTimeAsync(299_000);
+    expect(stalled.cancel).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(stalled.cancel).toHaveBeenCalled();
+    const events = await pending;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(events.find((e) => e.type === "done")?.type).toBe("done");
+  });
+
+  // A silently dead connection is caught by the OS (Node's fetch enables TCP
+  // keepalive: idle 60s, 10 × 1s probes), so read() rejects with undici's
+  // "terminated" long before the 300s idle window. Surface the socket error
+  // code and leave no watchdog behind.
+  it("surfaces a dropped socket with its cause and clears the watchdog", async () => {
+    const dropped = Object.assign(new TypeError("terminated"), { cause: Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }) });
+    const reader = {
+      read: vi
+        .fn()
+        .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(":event-type initial-response") })
+        .mockRejectedValueOnce(dropped),
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, body: { getReader: () => reader } }));
+
+    const events = await collect(streamKiro(makeModel({ id: "gpt-5-6-sol" }), makeContext(), { apiKey: "tok" }));
+
+    const err = events.find((e) => e.type === "error");
+    expect(err?.type === "error" && err.error.errorMessage).toBe("terminated (ETIMEDOUT)");
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

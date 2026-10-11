@@ -5,10 +5,12 @@ item numbers in comments.
 
 ## Transform (pi → Kiro)
 
-1. System prompt prepended to first user message, not sent as separate field.
-   `systemPrepended: true` flag prevents double-prepend.
+1. System prompt prepended to the current user message, not sent as a separate
+   field (Kiro has none) and never replayed into history.
 2. `modelId: kiroModelId` with dot format (e.g. `claude-sonnet-4.6`), converted
-   from pi's dash format via `resolveKiroModel()`.
+   from pi's dash format via `resolveKiroModel()`. Accepts the static catalog
+   and any ID in the dynamic catalog (ListAvailableModels or its disk cache),
+   so new Kiro models need no code change.
 3. `origin: "KIRO_CLI"` literal on every `userInputMessage`.
 4. Assistant `thinking` blocks serialized as `<thinking>...</thinking>` prefix
    to `content`.
@@ -97,7 +99,7 @@ item numbers in comments.
 32. `contextUsagePercentage` → `usage.input`:
     `Math.round((pct/100) * contextWindow)`; `contextPercent` exposed on usage.
 33. Output tokens: prefer `usage.outputTokens` event; fall back to
-    `countTokens(totalContent)` using a `Math.ceil(length / 4)` heuristic
+    a `Math.ceil(totalContent.length / 4)` heuristic
     (~4 chars/token). Approximation only — diverges from real BPE for code
     and CJK/emoji text; feeds cost reporting on the fallback path.
 34. `calculateCost(model, usage)` from pi-mono. Fallback to zeros on error.
@@ -119,7 +121,9 @@ item numbers in comments.
     retry, max 3, 500ms base backoff.
 42. First-token timeout (90s default, per-model override) → retry outer loop
     (max 3).
-43. Idle timeout (300s rolling between reads) → retry outer loop.
+43. Idle timeout (300s, same for every model; re-armed on each parsed event
+    once the first bytes arrive) → retry outer loop. Reasoning models can
+    think silently for minutes, so the window must not be shortened per model.
 44. Empty response (no text + no tool calls) → retry outer loop (max 3).
 45. Stream-level `error` event → retry outer loop, max 3.
 46. Abort signal honored at every await point. Surfaces as
@@ -153,10 +157,9 @@ item numbers in comments.
     `"odic"`, `"oidc"`, or `"idc"`. Falls back to the AWS SSO OIDC
     cache file at `~/.aws/sso/cache/kiro-auth-token.json` (or
     `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json` on Windows)
-    when the kiro-cli DB is missing/locked/unreadable. DB access first
-    tries `bun:sqlite`, then optional `better-sqlite3`, then the system
-    `sqlite3` CLI with SQL passed over stdin so refresh tokens are not
-    exposed in process argv. The cache is
+    when the kiro-cli DB is missing/locked/unreadable. DB access uses
+    `bun:sqlite`, else Node's built-in `node:sqlite` (Node >= 22.13).
+    The cache is
     written by Kiro IDE (the GUI), not kiro-cli, and contains
     `{accessToken, refreshToken, expiresAt, clientIdHash, authMethod,
     provider, region}`. `authMethod: "IdC"` maps to internal `"idc"`,

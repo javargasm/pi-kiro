@@ -1,16 +1,17 @@
-// Kiro OAuth — AWS Builder ID and IAM Identity Center (IdC).
+// Kiro OAuth — AWS Builder ID, IAM Identity Center (IdC), and local import.
 //
-// Two login methods, selected interactively:
+// Login methods, selected interactively:
 //
-//   1. Builder ID — AWS's personal-account SSO. Fixed start URL
-//      (https://view.awsapps.com/start), always us-east-1.
+//   1. Builder ID — Kiro's social sign-in (PKCE + localhost callback, same
+//      flow as kiro-cli), always us-east-1. Refreshes via the Kiro desktop
+//      auth endpoint. If the portal hands off to enterprise SSO, the flow
+//      continues as IdC.
 //   2. IdC — enterprise SSO. User supplies their company start URL
 //      (e.g. https://mycompany.awsapps.com/start); region is auto-detected
-//      across common AWS regions, or the user can specify it.
-//
-// Both methods use the same AWS SSO-OIDC device-code flow and the same
-// refresh endpoint. Social login (Google/GitHub) is not supported — it
-// requires kiro-cli, which we intentionally don't depend on.
+//      across common AWS regions, or the user can specify it. Uses the AWS
+//      SSO-OIDC device-code flow and refresh endpoint.
+//   3. Import from the local kiro-cli DB / Kiro IDE SSO cache.
+//   4. Desktop — a pasted Kiro desktop refresh token.
 //
 // NOTE on mirrored-cursor rendering glitch:
 // pi's login-dialog (modes/interactive/components/login-dialog.ts) appends
@@ -24,7 +25,6 @@
 
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { log } from "./debug";
-import { isPermanentError } from "./health";
 import {
   fetchAvailableModels,
   buildModelsFromApi,
@@ -35,6 +35,7 @@ import {
 import type { KiroCliCredentials, KiroCredentialSource } from "./kiro-cli-sync";
 import { createServer, type Server } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 export const BUILDER_ID_REGION = "us-east-1";
@@ -63,6 +64,8 @@ const IDC_PROBE_REGIONS = [
 /** 5-minute safety buffer subtracted from real token expiry. */
 const EXPIRES_BUFFER_MS = 5 * 60 * 1000;
 
+const AUTH_METHODS = ["builder-id", "idc", "desktop", "social"] as const;
+
 export interface KiroCredentials extends OAuthCredentials {
   clientId: string;
   /**
@@ -80,8 +83,9 @@ export interface KiroCredentials extends OAuthCredentials {
    * - `builder-id`: AWS Builder ID (personal AWS account, us-east-1).
    * - `idc`: IAM Identity Center (enterprise SSO, any region).
    * - `desktop`: Kiro IDE native install (bare refresh token, no clientId/clientSecret).
+   * - `social`: Builder ID via Kiro's social sign-in (refreshes like `desktop`).
    */
-  authMethod: "builder-id" | "idc" | "desktop" | "social";
+  authMethod: (typeof AUTH_METHODS)[number];
   /** Profile ARN from Kiro, used to scope API calls. */
   profileArn?: string;
   /** Local Kiro source, used only to decide safe CLI DB write-back. */
@@ -109,22 +113,6 @@ interface TokenResponse {
   accessToken?: string;
   refreshToken?: string;
   expiresIn?: number;
-}
-
-/** Promise-based delay that rejects promptly if the signal fires. */
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Login cancelled"));
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new Error("Login cancelled"));
-      },
-      { once: true },
-    );
-  });
 }
 
 async function tryRegisterAndAuthorize(
@@ -179,7 +167,7 @@ async function pollForToken(
 
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("Login cancelled");
-    await abortableDelay(interval, signal);
+    await sleep(interval, undefined, { signal });
 
     // Any transient failure (network, 5xx, non-JSON body) is treated like
     // `authorization_pending` — we keep polling until the deadline. The OIDC
@@ -242,30 +230,15 @@ const KIRO_SOCIAL_AUTH_ENDPOINT = `https://prod.${BUILDER_ID_REGION}.auth.deskto
 const SOCIAL_REDIRECT_PORT = 49153;
 const SOCIAL_REDIRECT_URI = `http://localhost:${SOCIAL_REDIRECT_PORT}`;
 
-function generateRandomState(): string {
-  return randomBytes(16).toString("base64url");
-}
-
-function generateCodeVerifier(): string {
-  return randomBytes(32).toString("base64url");
-}
-
-function generateCodeChallenge(verifier: string): string {
-  return createHash("sha256").update(verifier).digest("base64url");
-}
-
-function buildSocialSignInURL(
-  redirectUri: string,
-  codeChallenge: string,
-  state: string,
-): string {
-  const params = new URLSearchParams();
-  params.set("code_challenge", codeChallenge);
-  params.set("code_challenge_method", "S256");
-  params.set("redirect_from", "kirocli");
-  params.set("redirect_uri", redirectUri);
-  params.set("state", state);
-  return `${KIRO_SOCIAL_PORTAL}/signin?${params.toString()}`;
+function buildSocialSignInURL(redirectUri: string, codeChallenge: string, state: string): string {
+  const params = new URLSearchParams({
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    redirect_from: "kirocli",
+    redirect_uri: redirectUri,
+    state,
+  });
+  return `${KIRO_SOCIAL_PORTAL}/signin?${params}`;
 }
 
 function parseAuthRedirectInput(input: string): { code?: string; state?: string } {
@@ -298,203 +271,26 @@ function buildTokenRedirectUri(callbackPath: string, loginOption: string | null)
   return base;
 }
 
-/**
- * Render a styled OAuth callback page (success or error).
- * Dark theme with the Kiro ghost logo and PI-KIRO branding.
- * Success pages show a 3→2→1 countdown then redirect to app.kiro.dev.
- */
-function oauthCallbackPage(
-  kind: "success" | "error",
-  title: string,
-  message: string,
-  redirectUrl = "https://app.kiro.dev",
-): string {
-  const borderColor = kind === "success" ? "#22c55e" : "#ef4444";
-  const iconSvg =
-    kind === "success"
-      ? `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M16.67 5L7.5 14.17 3.33 10" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
-      : `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M15 5L5 15M5 5l10 10" stroke="#ef4444" stroke-width="2" stroke-linecap="round"/></svg>`;
-
-  // Kiro ghost SVG (simplified, white fill)
-  const ghostSvg = `<svg width="56" height="56" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M50 5C28.5 5 11 22.5 11 44v36c0 2.8 1.2 5.4 3.2 7.2 2 1.8 4.7 2.6 7.4 2.2l3.4-.5c3.2-.5 6.5.4 9 2.5l2.2 1.8c2.4 2 5.4 3 8.5 3h10.6c3.1 0 6.1-1.1 8.5-3l2.2-1.8c2.5-2.1 5.8-3 9-2.5l3.4.5c2.7.4 5.4-.4 7.4-2.2 2-1.8 3.2-4.4 3.2-7.2V44C89 22.5 71.5 5 50 5z" fill="white"/>
-    <circle cx="37" cy="45" r="7" fill="#0a0a0a"/>
-    <circle cx="63" cy="45" r="7" fill="#0a0a0a"/>
-  </svg>`;
-
-  const redirectHost = (() => {
-    try { return new URL(redirectUrl).hostname; } catch { return redirectUrl; }
-  })();
-
-  const countdownHtml =
-    kind === "success"
-      ? `
-    <div class="countdown" id="countdown">
-      <svg class="ring" viewBox="0 0 60 60">
-        <circle cx="30" cy="30" r="26" stroke="#1a1a1a" stroke-width="3" fill="none"/>
-        <circle id="ring-progress" cx="30" cy="30" r="26" stroke="#22c55e" stroke-width="3" fill="none"
-          stroke-dasharray="163.36" stroke-dashoffset="0" stroke-linecap="round"
-          transform="rotate(-90 30 30)" style="transition:stroke-dashoffset 1s linear"/>
-      </svg>
-      <span class="countdown-num" id="countdown-num">3</span>
-    </div>
-    <p class="subtitle">Redirecting to <strong>${redirectHost}</strong>…</p>
-    <script>
-      (function(){
-        var n=3, el=document.getElementById('countdown-num'),
-            ring=document.getElementById('ring-progress'), circ=163.36;
-        function tick(){
-          if(n<=0){window.location.href=${JSON.stringify(redirectUrl)};return}
-          el.textContent=n;
-          ring.setAttribute('stroke-dashoffset', String(circ*(1-n/3)));
-          n--;
-          setTimeout(tick,1000);
-        }
-        tick();
-      })();
-    </script>`
-      : `<p class="subtitle">Please close this window and try again</p>`;
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PI-KIRO — Authentication</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#0a0a0a;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
-    .container{max-width:420px;padding:2rem}
-    .logo{display:flex;align-items:center;justify-content:center;gap:16px;margin-bottom:48px}
-    .logo-text{font-size:42px;font-weight:700;letter-spacing:6px;color:#7c3aed;font-family:'Courier New',monospace}
-    .status-box{border:1.5px solid ${borderColor};border-radius:12px;padding:20px 28px;display:flex;align-items:flex-start;gap:14px;text-align:left;margin-bottom:20px;background:rgba(${kind === "success" ? "34,197,94" : "239,68,68"},0.04)}
-    .status-icon{flex-shrink:0;margin-top:2px}
-    .status-title{font-size:15px;font-weight:600;color:${borderColor};margin-bottom:4px}
-    .status-msg{font-size:13px;color:#a3a3a3;line-height:1.4}
-    .subtitle{font-size:13px;color:#737373;margin-top:4px}
-    .subtitle strong{color:#a3a3a3}
-    .countdown{position:relative;width:60px;height:60px;margin:24px auto 12px}
-    .ring{width:60px;height:60px}
-    .countdown-num{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:#22c55e;font-variant-numeric:tabular-nums}
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="logo">
-      ${ghostSvg}
-      <span class="logo-text">PI-KIRO</span>
-    </div>
-    <div class="status-box">
-      <span class="status-icon">${iconSvg}</span>
-      <div>
-        <div class="status-title">${title}</div>
-        <div class="status-msg">${message}</div>
-      </div>
-    </div>
-    ${countdownHtml}
-  </div>
-</body>
-</html>`;
+/** Minimal page served to the browser on the OAuth callback server. */
+function oauthPage(title: string, body: string, head = ""): string {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>pi-kiro — ${title}</title>${head}</head>` +
+    `<body style="font-family:system-ui,sans-serif;text-align:center;padding-top:20vh">` +
+    `<h1>${title}</h1>${body}</body></html>`;
 }
 
-/**
- * Enterprise IdC delegation page: polls /idc-verify until the device
- * verification URL is ready, then does a 3→2→1 countdown and redirects.
- */
-function oauthIdcDelegationPage(): string {
-  const ghostSvg = `<svg width="56" height="56" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M50 5C28.5 5 11 22.5 11 44v36c0 2.8 1.2 5.4 3.2 7.2 2 1.8 4.7 2.6 7.4 2.2l3.4-.5c3.2-.5 6.5.4 9 2.5l2.2 1.8c2.4 2 5.4 3 8.5 3h10.6c3.1 0 6.1-1.1 8.5-3l2.2-1.8c2.5-2.1 5.8-3 9-2.5l3.4.5c2.7.4 5.4-.4 7.4-2.2 2-1.8 3.2-4.4 3.2-7.2V44C89 22.5 71.5 5 50 5z" fill="white"/>
-    <circle cx="37" cy="45" r="7" fill="#0a0a0a"/>
-    <circle cx="63" cy="45" r="7" fill="#0a0a0a"/>
-  </svg>`;
+const SIGNED_IN_PAGE = oauthPage(
+  "Signed in",
+  "<p>You can close this tab. Redirecting to app.kiro.dev…</p>",
+  '<meta http-equiv="refresh" content="3;url=https://app.kiro.dev">',
+);
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PI-KIRO — Enterprise Sign-In</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#0a0a0a;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
-    .container{max-width:420px;padding:2rem}
-    .logo{display:flex;align-items:center;justify-content:center;gap:16px;margin-bottom:48px}
-    .logo-text{font-size:42px;font-weight:700;letter-spacing:6px;color:#7c3aed;font-family:'Courier New',monospace}
-    .status-box{border:1.5px solid #22c55e;border-radius:12px;padding:20px 28px;display:flex;align-items:flex-start;gap:14px;text-align:left;margin-bottom:20px;background:rgba(34,197,94,0.04)}
-    .status-icon{flex-shrink:0;margin-top:2px}
-    .status-title{font-size:15px;font-weight:600;color:#22c55e;margin-bottom:4px}
-    .status-msg{font-size:13px;color:#a3a3a3;line-height:1.4}
-    .subtitle{font-size:13px;color:#737373;margin-top:4px}
-    .subtitle strong{color:#a3a3a3}
-    .spinner{width:28px;height:28px;border:3px solid #1a1a1a;border-top-color:#22c55e;border-radius:50%;animation:spin 0.8s linear infinite;margin:24px auto 12px}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    .countdown{position:relative;width:60px;height:60px;margin:24px auto 12px;display:none}
-    .ring{width:60px;height:60px}
-    .countdown-num{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:#22c55e;font-variant-numeric:tabular-nums}
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="logo">
-      ${ghostSvg}
-      <span class="logo-text">PI-KIRO</span>
-    </div>
-    <div class="status-box">
-      <span class="status-icon"><svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M16.67 5L7.5 14.17 3.33 10" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-      <div>
-        <div class="status-title">Enterprise sign-in</div>
-        <div class="status-msg" id="status-msg">Preparing device authorization…</div>
-      </div>
-    </div>
-    <div class="spinner" id="spinner"></div>
-    <div class="countdown" id="countdown">
-      <svg class="ring" viewBox="0 0 60 60">
-        <circle cx="30" cy="30" r="26" stroke="#1a1a1a" stroke-width="3" fill="none"/>
-        <circle id="ring-progress" cx="30" cy="30" r="26" stroke="#22c55e" stroke-width="3" fill="none"
-          stroke-dasharray="163.36" stroke-dashoffset="0" stroke-linecap="round"
-          transform="rotate(-90 30 30)" style="transition:stroke-dashoffset 1s linear"/>
-      </svg>
-      <span class="countdown-num" id="countdown-num">3</span>
-    </div>
-    <p class="subtitle" id="subtitle">Waiting for device authorization…</p>
-    <script>
-      (function(){
-        var msg=document.getElementById('status-msg'),
-            spinner=document.getElementById('spinner'),
-            cd=document.getElementById('countdown'),
-            cdNum=document.getElementById('countdown-num'),
-            ring=document.getElementById('ring-progress'),
-            sub=document.getElementById('subtitle'),
-            circ=163.36;
-
-        function poll(){
-          fetch('/idc-verify').then(function(r){return r.json()}).then(function(d){
-            if(d.url){
-              spinner.style.display='none';
-              cd.style.display='block';
-              msg.textContent='Device authorization ready';
-              try{sub.innerHTML='Redirecting to <strong>'+new URL(d.url).hostname+'</strong>…'}catch(e){}
-              countdown(3,d.url);
-            } else {
-              setTimeout(poll,500);
-            }
-          }).catch(function(){setTimeout(poll,1000)});
-        }
-
-        function countdown(n,url){
-          if(n<=0){window.location.href=url;return}
-          cdNum.textContent=n;
-          ring.setAttribute('stroke-dashoffset',String(circ*(1-n/3)));
-          setTimeout(function(){countdown(n-1,url)},1000);
-        }
-
-        poll();
-      })();
-    </script>
-  </div>
-</body>
-</html>`;
-}
+/** Enterprise IdC hand-off: poll /idc-verify, then follow the device verification URL. */
+const IDC_DELEGATION_PAGE = oauthPage(
+  "Enterprise sign-in",
+  "<p>Preparing device authorization…</p>" +
+    "<script>(function poll(){fetch('/idc-verify').then(function(r){return r.json()})" +
+    ".then(function(d){if(d.url)location.href=d.url;else setTimeout(poll,500)},function(){setTimeout(poll,1000)})})()</script>",
+);
 
 function startCallbackServer(
   expectedState: string,
@@ -545,16 +341,12 @@ function startCallbackServer(
 
         if (state !== expectedState) {
           res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(oauthCallbackPage("error", "State mismatch", "The OAuth state parameter did not match. Please try logging in again."));
+          res.end(oauthPage("State mismatch", "<p>The OAuth state parameter did not match. Please try logging in again.</p>"));
           return;
         }
 
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        if (isIdcDelegation) {
-          res.end(oauthIdcDelegationPage());
-        } else {
-          res.end(oauthCallbackPage("success", "Request approved", "PI-KIRO has been given requested permissions."));
-        }
+        res.end(isIdcDelegation ? IDC_DELEGATION_PAGE : SIGNED_IN_PAGE);
         settleWait?.({
           code,
           state,
@@ -585,6 +377,22 @@ function startCallbackServer(
   });
 }
 
+/** Fetch this account's model list and cache it for the provider. Non-fatal. */
+async function cacheModels(
+  accessToken: string,
+  region: string,
+  profileArn: string,
+  after: string,
+): Promise<void> {
+  try {
+    const apiModels = await fetchAvailableModels(accessToken, resolveApiRegion(region), profileArn);
+    setCachedDynamicModels(buildModelsFromApi(apiModels));
+    log.info(`Fetched and cached ${apiModels.length} models after ${after}`);
+  } catch (err) {
+    log.warn(`Failed to fetch models after ${after}: ${err}`);
+  }
+}
+
 /** Result from the localhost callback server. */
 interface SocialCallbackResult {
   /** Authorization code (null for IdC delegation). */
@@ -608,9 +416,9 @@ interface SocialTokenResponse {
 async function runSocialSignInFlow(
   callbacks: OAuthLoginCallbacks,
 ): Promise<KiroCredentials> {
-  const verifier = generateCodeVerifier();
-  const challenge = generateCodeChallenge(verifier);
-  const state = generateRandomState();
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  const state = randomBytes(16).toString("base64url");
 
   const callbackServer = await startCallbackServer(state);
 
@@ -692,7 +500,7 @@ async function runSocialSignInFlow(
         },
       };
       try {
-        return await runDeviceCodeFlow(wrappedCallbacks, callbackResult.issuerUrl, [idcRegion], "idc");
+        return await runDeviceCodeFlow(wrappedCallbacks, callbackResult.issuerUrl, [idcRegion]);
       } finally {
         callbackServer.server.close();
       }
@@ -736,14 +544,7 @@ async function runSocialSignInFlow(
 
     // Social flow returns profileArn — fetch and cache models immediately.
     if (data.profileArn) {
-      try {
-        const apiRegion = resolveApiRegion(BUILDER_ID_REGION);
-        const apiModels = await fetchAvailableModels(data.accessToken, apiRegion, data.profileArn);
-        setCachedDynamicModels(buildModelsFromApi(apiModels));
-        log.info(`Fetched and cached ${apiModels.length} models after social sign-in`);
-      } catch (err) {
-        log.warn(`Failed to fetch models after social sign-in: ${err}`);
-      }
+      await cacheModels(data.accessToken, BUILDER_ID_REGION, data.profileArn, "social sign-in");
     }
 
     return {
@@ -822,7 +623,7 @@ export async function loginKiro(callbacks: OAuthLoginCallbacks): Promise<KiroCre
     region ? `Connecting to ${region}…` : "Detecting your Identity Center region…",
   );
 
-  return runDeviceCodeFlow(callbacks, startUrl, regions, "idc");
+  return runDeviceCodeFlow(callbacks, startUrl, regions);
 }
 
 /**
@@ -850,14 +651,7 @@ async function loginCliSync(callbacks: OAuthLoginCallbacks): Promise<KiroCredent
   );
 
   if (imported.profileArn) {
-    try {
-      const apiRegion = resolveApiRegion(imported.region);
-      const apiModels = await fetchAvailableModels(imported.accessToken, apiRegion, imported.profileArn);
-      setCachedDynamicModels(buildModelsFromApi(apiModels));
-      log.info(`Fetched and cached ${apiModels.length} models after CLI sync`);
-    } catch (err) {
-      log.warn(`Failed to fetch models after CLI sync: ${err}`);
-    }
+    await cacheModels(imported.accessToken, imported.region, imported.profileArn, "CLI sync");
   }
 
   // Route through kiroCredsFromCliImport so the struct `authMethod` is
@@ -914,7 +708,6 @@ async function runDeviceCodeFlow(
   callbacks: OAuthLoginCallbacks,
   startUrl: string,
   regions: string[],
-  authMethod: "builder-id" | "idc",
 ): Promise<KiroCredentials> {
   let result: Awaited<ReturnType<typeof tryRegisterAndAuthorize>> | null = null;
   let detectedRegion = "";
@@ -958,18 +751,11 @@ async function runDeviceCodeFlow(
   callbacks.onProgress?.("Resolving Kiro profile…");
   let profileArn: string | undefined;
   try {
-    const apiRegion = resolveApiRegion(detectedRegion);
-    const resolved = await resolveProfileArn(tok.accessToken, apiRegion);
+    const resolved = await resolveProfileArn(tok.accessToken, resolveApiRegion(detectedRegion));
     if (resolved) {
       profileArn = resolved;
       log.info(`Resolved profileArn during login: ${profileArn}`);
-      try {
-        const apiModels = await fetchAvailableModels(tok.accessToken, apiRegion, profileArn);
-        setCachedDynamicModels(buildModelsFromApi(apiModels));
-        log.info(`Fetched and cached ${apiModels.length} models after login`);
-      } catch (err) {
-        log.warn(`Failed to fetch models during login: ${err}`);
-      }
+      await cacheModels(tok.accessToken, detectedRegion, profileArn, "login");
     } else {
       log.warn("Could not resolve profileArn during login");
     }
@@ -978,30 +764,25 @@ async function runDeviceCodeFlow(
   }
 
   return {
-    refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|${authMethod}`,
+    refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc`,
     access: tok.accessToken,
     expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
     clientId: result.clientId,
     clientSecret: result.clientSecret,
     region: detectedRegion,
-    authMethod,
+    authMethod: "idc",
     ...(profileArn ? { profileArn } : {}),
   };
 }
 
 /**
  * Sync refreshed credentials back to the Kiro CLI DB.
- * Fire-and-forget — a failed write-back is non-fatal. Only credentials
- * imported from a specific kiro-cli DB token row are eligible; Kiro IDE SSO
- * cache / desktop refresh tokens are a different token family and must not be
- * written into the CLI DB.
+ * Fire-and-forget — a failed write-back is non-fatal. saveKiroCliCredentials
+ * only writes credentials imported from a specific kiro-cli DB token row;
+ * Kiro IDE SSO cache / desktop refresh tokens are a different token family
+ * and are never written into the CLI DB.
  */
 async function syncBackToKiroCli(result: KiroCredentials): Promise<void> {
-  if (result.kiroSyncSource !== "kiro-cli-db" || !result.kiroSyncTokenKey) {
-    log.debug("Credential sync-back skipped: credential did not originate from kiro-cli DB");
-    return;
-  }
-
   try {
     const { saveKiroCliCredentials } = await import("./kiro-cli-sync");
     const synced = await saveKiroCliCredentials({
@@ -1065,83 +846,32 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
   const refreshToken = parts[0] ?? "";
   const clientId = parts[1] ?? credentials.clientId ?? "";
   const clientSecret = parts[2] ?? credentials.clientSecret ?? "";
-  const region = credentials.region;
-  const authMethod = credentials.authMethod;
+  const { region, authMethod } = credentials;
+  // Desktop/social auth uses Kiro's own auth endpoint (no OIDC client required).
+  const desktop = authMethod === "desktop" || authMethod === "social";
 
   if (!refreshToken || !region) {
     throw new Error("Refresh token is missing region — re-login required");
   }
-  if (authMethod !== "desktop" && authMethod !== "social" && (!clientId || !clientSecret)) {
+  if (!desktop && (!clientId || !clientSecret)) {
     throw new Error("Refresh token is missing clientId/clientSecret — re-login required");
   }
 
-  // Desktop auth uses Kiro's own auth endpoint (no OIDC client required).
-  if (authMethod === "desktop" || authMethod === "social") {
-    const desktopEndpoint = `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`;
-    const resp = await fetch(desktopEndpoint, {
+  const resp = await fetch(
+    desktop
+      ? `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`
+      : `https://oidc.${region}.amazonaws.com/token`,
+    {
       method: "POST",
       headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
-      body: JSON.stringify({ refreshToken }),
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      throw new Error(`Desktop token refresh failed: ${resp.status} ${body}`);
-    }
-
-    const data = (await resp.json()) as {
-      accessToken: string;
-      refreshToken: string;
-      expiresIn?: number;
-    };
-
-    let profileArn = credentials.profileArn;
-    if (!profileArn) {
-      try {
-        const apiRegion = resolveApiRegion(region);
-        const resolved = await resolveProfileArn(data.accessToken, apiRegion);
-        if (resolved) {
-          profileArn = resolved;
-          log.info(`Resolved profileArn during desktop refresh: ${profileArn}`);
-        }
-      } catch (err) {
-        log.warn(`Failed to resolve profileArn during desktop refresh: ${err}`);
-      }
-    }
-
-    if (profileArn) {
-      try {
-        const apiRegion = resolveApiRegion(region);
-        const apiModels = await fetchAvailableModels(data.accessToken, apiRegion, profileArn);
-        setCachedDynamicModels(buildModelsFromApi(apiModels));
-        log.info(`Fetched and cached ${apiModels.length} models after desktop token refresh`);
-      } catch (err) {
-        log.warn(`Failed to fetch models after desktop token refresh: ${err}`);
-      }
-    }
-
-    return {
-      refresh: `${data.refreshToken}|||${authMethod}`,
-      access: data.accessToken,
-      expires: Date.now() + (data.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
-      clientId: "",
-      clientSecret: "",
-      region,
-      authMethod,
-      profileArn,
-      kiroSyncSource: credentials.kiroSyncSource,
-      kiroSyncTokenKey: credentials.kiroSyncTokenKey,
-    };
-  }
-
-  const endpoint = `https://oidc.${region}.amazonaws.com/token`;
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "pi-kiro" },
-    body: JSON.stringify({ clientId, clientSecret, refreshToken, grantType: "refresh_token" }),
-  });
+      body: JSON.stringify(
+        desktop ? { refreshToken } : { clientId, clientSecret, refreshToken, grantType: "refresh_token" },
+      ),
+    },
+  );
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
-    throw new Error(`Token refresh failed: ${resp.status} ${body}`);
+    throw new Error(`${desktop ? "Desktop token" : "Token"} refresh failed: ${resp.status} ${body}`);
   }
 
   const data = (await resp.json()) as {
@@ -1153,34 +883,22 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
   let profileArn = credentials.profileArn;
   if (!profileArn) {
     try {
-      const apiRegion = resolveApiRegion(region);
-      const resolved = await resolveProfileArn(data.accessToken, apiRegion);
-      if (resolved) {
-        profileArn = resolved;
-        log.info(`Resolved profileArn during OIDC refresh: ${profileArn}`);
-      }
+      profileArn = (await resolveProfileArn(data.accessToken, resolveApiRegion(region))) ?? undefined;
+      if (profileArn) log.info(`Resolved profileArn during token refresh: ${profileArn}`);
     } catch (err) {
-      log.warn(`Failed to resolve profileArn during OIDC refresh: ${err}`);
+      log.warn(`Failed to resolve profileArn during token refresh: ${err}`);
     }
   }
-
-  if (profileArn) {
-    try {
-      const apiRegion = resolveApiRegion(region);
-      const apiModels = await fetchAvailableModels(data.accessToken, apiRegion, profileArn);
-      setCachedDynamicModels(buildModelsFromApi(apiModels));
-      log.info(`Fetched and cached ${apiModels.length} models after token refresh`);
-    } catch (err) {
-      log.warn(`Failed to fetch models after token refresh, falling back: ${err}`);
-    }
-  }
+  if (profileArn) await cacheModels(data.accessToken, region, profileArn, "token refresh");
 
   return {
-    refresh: `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
+    refresh: desktop
+      ? `${data.refreshToken}|||${authMethod}`
+      : `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
     access: data.accessToken,
     expires: Date.now() + (data.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
-    clientId,
-    clientSecret,
+    clientId: desktop ? "" : clientId,
+    clientSecret: desktop ? "" : clientSecret,
     region,
     authMethod,
     profileArn,
@@ -1190,14 +908,12 @@ async function refreshTokenInner(credentials: KiroCredentials): Promise<KiroCred
 }
 
 /**
- * 5-layer credential refresh cascade.
+ * 3-layer credential refresh cascade.
  *
  * Layers (each falls through to the next on failure):
  *   1. Normal OIDC/desktop refresh with current credentials
  *   2. Import fresh credentials from Kiro CLI DB → use as-is
  *   3. Import fresh credentials from Kiro CLI DB → refresh those
- *   4. Import expired credentials from Kiro CLI DB → use as-is
- *   5. Import expired credentials from Kiro CLI DB → refresh those
  *
  * After any successful refresh, the new tokens are synced back to the
  * Kiro CLI DB (fire-and-forget) for bidirectional sync.
@@ -1206,17 +922,8 @@ export async function refreshKiroToken(
   credentials: OAuthCredentials,
 ): Promise<KiroCredentials> {
   const inputMethod = (credentials as Partial<KiroCredentials>).authMethod;
-  const authMethod: "builder-id" | "idc" | "desktop" | "social" =
-    inputMethod === "builder-id" || inputMethod === "idc" || inputMethod === "desktop" || inputMethod === "social"
-      ? inputMethod
-      : "idc";
-  if (
-    inputMethod !== undefined &&
-    inputMethod !== "builder-id" &&
-    inputMethod !== "idc" &&
-    inputMethod !== "desktop" &&
-    inputMethod !== "social"
-  ) {
+  const knownMethod = AUTH_METHODS.find((m) => m === inputMethod);
+  if (inputMethod !== undefined && !knownMethod) {
     log.warn(`refreshKiroToken: unrecognized authMethod "${String(inputMethod)}" — defaulting to "idc"`);
   }
 
@@ -1225,97 +932,46 @@ export async function refreshKiroToken(
     clientId: (credentials as KiroCredentials).clientId ?? credentials.refresh.split("|")[1] ?? "",
     clientSecret: (credentials as KiroCredentials).clientSecret ?? credentials.refresh.split("|")[2] ?? "",
     region: (credentials as KiroCredentials).region,
-    authMethod,
+    authMethod: knownMethod ?? "idc",
   };
 
-  const errors: string[] = [];
-
-  // ── Layer 1: Normal refresh with current credentials ──────────
-  try {
-    log.debug("refresh.cascade: layer 1 — normal refresh");
-    const result = await refreshTokenInner(baseCreds);
+  const refreshAndSync = async (creds: KiroCredentials): Promise<KiroCredentials> => {
+    const result = await refreshTokenInner(creds);
     void syncBackToKiroCli(result);
     return result;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`L1(normal): ${msg}`);
-    log.warn(`refresh.cascade: layer 1 failed — ${msg}`);
-  }
+  };
 
-  // ── Layer 2: Import fresh Kiro CLI credentials → use as-is ────
   let freshImport: KiroCliCredentials | null = null;
-  try {
-    log.debug("refresh.cascade: layer 2 — fresh kiro-cli import");
-    const { importFromKiroCli } = await import("./kiro-cli-sync");
-    freshImport = await importFromKiroCli();
-    if (freshImport?.accessToken) {
-      const result = kiroCredsFromCliImport(freshImport);
-      log.info("refresh.cascade: layer 2 succeeded — using fresh kiro-cli credentials");
-      return result;
-    }
-    errors.push("L2(fresh-import): no valid credentials found");
-    log.debug("refresh.cascade: layer 2 — no fresh credentials");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`L2(fresh-import): ${msg}`);
-    log.warn(`refresh.cascade: layer 2 failed — ${msg}`);
-  }
+  const layers: Array<[string, () => Promise<KiroCredentials | null>]> = [
+    ["L1(normal)", () => refreshAndSync(baseCreds)],
+    ["L2(fresh-import)", async () => {
+      const { importFromKiroCli } = await import("./kiro-cli-sync");
+      freshImport = await importFromKiroCli();
+      return freshImport?.accessToken ? kiroCredsFromCliImport(freshImport) : null;
+    }],
+    ["L3(refresh-fresh)", async () =>
+      freshImport?.refreshToken ? refreshAndSync(kiroCredsFromCliImport(freshImport)) : null],
+  ];
 
-  // ── Layer 3: Refresh the fresh Kiro CLI credentials ───────────
-  if (freshImport?.refreshToken) {
+  const errors: string[] = [];
+  for (const [name, attempt] of layers) {
     try {
-      log.debug("refresh.cascade: layer 3 — refresh fresh kiro-cli creds");
-      const freshCreds = kiroCredsFromCliImport(freshImport);
-      const result = await refreshTokenInner(freshCreds);
-      void syncBackToKiroCli(result);
-      log.info("refresh.cascade: layer 3 succeeded — refreshed fresh kiro-cli credentials");
-      return result;
+      log.debug(`refresh.cascade: ${name}`);
+      const result = await attempt();
+      if (result) {
+        log.info(`refresh.cascade: ${name} succeeded`);
+        return result;
+      }
+      errors.push(`${name}: no valid credentials found`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`L3(refresh-fresh): ${msg}`);
-      log.warn(`refresh.cascade: layer 3 failed — ${msg}`);
+      errors.push(`${name}: ${msg}`);
+      log.warn(`refresh.cascade: ${name} failed — ${msg}`);
     }
   }
 
-  // ── Layer 4: Import expired Kiro CLI credentials → use as-is ──
-  let expiredImport: KiroCliCredentials | null = null;
-  try {
-    log.debug("refresh.cascade: layer 4 — expired kiro-cli import");
-    const { getKiroCliCredentialsAllowExpired } = await import("./kiro-cli-sync");
-    expiredImport = await getKiroCliCredentialsAllowExpired(freshImport);
-    if (expiredImport?.accessToken) {
-      const result = kiroCredsFromCliImport(expiredImport);
-      log.info("refresh.cascade: layer 4 succeeded — using expired kiro-cli credentials");
-      return result;
-    } else {
-      errors.push("L4(expired-import): no different expired credentials");
-      log.debug("refresh.cascade: layer 4 — no additional expired credentials");
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`L4(expired-import): ${msg}`);
-    log.warn(`refresh.cascade: layer 4 failed — ${msg}`);
-  }
-
-  // ── Layer 5: Refresh the expired Kiro CLI credentials ─────────
-  if (expiredImport?.refreshToken) {
-    try {
-      log.debug("refresh.cascade: layer 5 — refresh expired kiro-cli creds");
-      const expiredCreds = kiroCredsFromCliImport(expiredImport);
-      const result = await refreshTokenInner(expiredCreds);
-      void syncBackToKiroCli(result);
-      log.info("refresh.cascade: layer 5 succeeded — refreshed expired kiro-cli credentials");
-      return result;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`L5(refresh-expired): ${msg}`);
-      log.warn(`refresh.cascade: layer 5 failed — ${msg}`);
-    }
-  }
-
-  // All layers exhausted.
   throw new Error(
-    `Kiro token refresh failed — all 5 cascade layers exhausted. ` +
+    `Kiro token refresh failed — all ${layers.length} cascade layers exhausted. ` +
     `Re-login required.\n${errors.join("\n")}`,
   );
 }

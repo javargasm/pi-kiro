@@ -82,11 +82,8 @@ describe("parseKiroEvent", () => {
       data: { error: "X", message: "Y" },
     });
   });
-  it("returns followupPrompt", () => {
-    expect(parseKiroEvent({ followupPrompt: "p" })).toEqual({
-      type: "followupPrompt",
-      data: "p",
-    });
+  it("ignores followupPrompt frames", () => {
+    expect(parseKiroEvent({ followupPrompt: "p" })).toBeNull();
   });
   it("returns reasoning event with text and signature", () => {
     const e = parseKiroEvent({

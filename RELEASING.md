@@ -35,9 +35,10 @@ Pushing the `v*` tag triggers `.github/workflows/release.yml`, which runs
   `bun run build`, `npm publish`. Has `permissions: id-token: write` for OIDC.
 - **npm Trusted Publisher** — configured at npmjs.com for
   `@javargasm/pi-kiro` → repo `javargasm/pi-kiro`, workflow `release.yml`.
-- **Lifecycle hooks** — `prepublishOnly` runs the full `check`; `prepack`
+- **Lifecycle hooks** — `prepublishOnly` runs the full `check`; `prepare`
   runs `build`. The published tarball is always type-checked, tested, and
-  freshly built.
+  freshly built. `prepare` also covers `pi install git:…`, which clones the
+  raw repo without the gitignored `dist/`.
 
 ## Gotchas (learned the hard way)
 

@@ -37,8 +37,7 @@ export type { KiroModel } from "./models";
 export { isPermanentError } from "./health";
 export {
 	importFromKiroCli,
-	getKiroCliCredentialsAllowExpired,
 	saveKiroCliCredentials,
 } from "./kiro-cli-sync";
 export type { KiroCliCredentials } from "./kiro-cli-sync";
-export { MAX_KIRO_IMAGES, MAX_KIRO_IMAGE_BYTES, collapseAgenticLoops } from "./transform";
+export { MAX_KIRO_IMAGES, MAX_KIRO_IMAGE_BYTES } from "./transform";

@@ -26,6 +26,18 @@ export const TOOL_PURPOSE_FIELD = {
   description: "A brief explanation why you are making this tool use.",
 } as const;
 
+/**
+ * Kiro CLI user-agent pair for an AWS service (`codewhispererruntime`,
+ * `codewhispererstreaming`) as sent from the given OS.
+ */
+export function kiroUserAgents(api: string, os: string): { "user-agent": string; "x-amz-user-agent": string } {
+  const base = `aws-sdk-rust/1.3.15 ua/2.1 api/${api}/0.1.16551 os/${os} lang/rust/1.92.0`;
+  return {
+    "user-agent": `${base} md/appVersion-2.9.0 app/AmazonQ-For-CLI`,
+    "x-amz-user-agent": `${base} m/F app/AmazonQ-For-CLI`,
+  };
+}
+
 /** Map `process.platform` to Kiro's `operatingSystem` values. */
 export function resolveOS(): string {
   switch (process.platform) {

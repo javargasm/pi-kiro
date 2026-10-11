@@ -14,6 +14,10 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+// Device-code polling sleeps via node:timers/promises, which fake timers
+// don't cover — resolve immediately so polling tests don't wait real seconds.
+vi.mock("node:timers/promises", () => ({ setTimeout: () => Promise.resolve() }));
+
 import { loginKiro, refreshKiroToken } from "../src/oauth";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -448,7 +452,7 @@ describe("refreshKiroToken", () => {
     expect(readFileSync).not.toHaveBeenCalled();
   });
 
-  it("does not retry the same imported refresh-only credential in expired cascade layers", async () => {
+  it("refreshes an imported refresh-only credential once, then gives up", async () => {
     const { homedir } = await import("node:os");
     const { join } = await import("node:path");
     const cachePath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json");
@@ -473,7 +477,7 @@ describe("refreshKiroToken", () => {
         region: "eu-central-1",
         authMethod: "idc",
       } as any),
-    ).rejects.toThrow(/no different expired credentials/);
+    ).rejects.toThrow(/all 3 cascade layers exhausted/);
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0]?.[0]).toBe("https://oidc.eu-central-1.amazonaws.com/token");

@@ -6,14 +6,64 @@
 // the padding used to cause echo-loop bugs downstream.
 
 import type {
+  AssistantMessage,
+  Context,
   ImageContent,
   Message,
   TextContent,
   ThinkingContent,
-  ToolCall,
-  ToolResultMessage,
+  Tool,
 } from "@earendil-works/pi-ai";
 import { createHash } from "node:crypto";
+
+// pi-ai >= 0.87 system message. Declared locally so we still build against
+// older pi-ai whose Message union has no "system" role.
+interface SystemMessageLike {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: Array<{ name: string }>;
+}
+
+function textOf(content: string | TextContent[]): string {
+  return typeof content === "string" ? content : content.map((c) => c.text).join("");
+}
+
+/** pi >= 0.87 moves `systemPrompt`/`tools` into `role: "system"` messages
+ *  (leading prompt + mid-conversation deltas). Kiro has no system role, so
+ *  replay them the way pi-ai's getCurrentSystemPrompt/getCurrentTools do and
+ *  return a context with only user/assistant/toolResult messages. */
+export function resolveContext(context: Context): Context {
+  const all = context.messages as Array<Message | SystemMessageLike>;
+  if (!all.some((m) => m.role === "system")) return context;
+
+  const content: string[] = context.systemPrompt ? [context.systemPrompt] : [];
+  const sections = new Map<string, string>();
+  const tools = new Map<string, Tool>((context.tools ?? []).map((t) => [t.name, t]));
+  const messages: Message[] = [];
+  for (const m of all) {
+    if (m.role !== "system") {
+      messages.push(m);
+      continue;
+    }
+    const text = textOf(m.content);
+    if (text) content.push(text);
+    for (const [name, value] of Object.entries(m.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+    for (const t of m.toolsRemoved ?? []) tools.delete(t.name);
+    for (const t of m.toolsAdded ?? []) tools.set(t.name, t);
+  }
+  const systemPrompt = [content.join("\n\n"), ...sections.values()].filter(Boolean).join("\n\n");
+  return {
+    ...context,
+    systemPrompt: systemPrompt || undefined,
+    tools: tools.size > 0 ? [...tools.values()] : undefined,
+    messages,
+  };
+}
 
 
 /** Drop assistant messages that ended in error/aborted — partial turns
@@ -242,23 +292,68 @@ export function convertImagesToKiro(
   return { images: valid, omitted };
 }
 
+/**
+ * pi assistant message → Kiro assistantResponseMessage, or null when it carries
+ * nothing. Thinking is replayed as `reasoningContent`, never inline
+ * `<thinking>` tags, and only with a signature — Bedrock rejects a missing or
+ * corrupt one with THINKING_SIGNATURE_INVALID.
+ */
+export function toKiroAssistant(msg: AssistantMessage): KiroAssistantResponseMessage | null {
+  let content = "";
+  let reasoningText = "";
+  let signature = "";
+  const toolUses: KiroToolUse[] = [];
+  for (const block of Array.isArray(msg.content) ? msg.content : []) {
+    if (block.type === "text") {
+      content += block.text;
+    } else if (block.type === "thinking") {
+      reasoningText += block.thinking;
+      if (block.thinkingSignature) signature = block.thinkingSignature;
+    } else if (block.type === "toolCall") {
+      toolUses.push({
+        name: block.name,
+        toolUseId: toKiroToolUseId(block.id),
+        input: parseToolArgs(block.arguments),
+      });
+    }
+  }
+  if (!content && toolUses.length === 0 && !reasoningText) return null;
+  return {
+    content,
+    ...(toolUses.length > 0 ? { toolUses } : {}),
+    ...(reasoningText && signature
+      ? { reasoningContent: { reasoningText: { text: reasoningText, signature } } }
+      : {}),
+  };
+}
+
+/** pi toolResult messages (others are skipped) → Kiro toolResults + their images. */
+export function toKiroToolResults(msgs: Message[]): { toolResults: KiroToolResult[]; images: ImageContent[] } {
+  const toolResults: KiroToolResult[] = [];
+  const images: ImageContent[] = [];
+  for (const m of msgs) {
+    if (m.role !== "toolResult") continue;
+    toolResults.push({
+      content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
+      status: m.isError ? "error" : "success",
+      toolUseId: toKiroToolUseId(m.toolCallId),
+    });
+    for (const c of m.content) if (c.type === "image") images.push(c);
+  }
+  return { toolResults, images };
+}
+
 // ---- History builder ---------------------------------------------------
 
 /**
  * Split messages into history + current turn. The current turn is the trailing
  * user message (+ any following tool results) or the trailing assistant
  * message when it carries tool calls. Everything before goes into history.
- *
- * System prompt is prepended to the first user message in history, not sent
- * as a separate field (Kiro doesn't have one).
  */
 export function buildHistory(
   messages: Message[],
-  _modelId: string,
-  systemPrompt?: string,
-): { history: KiroHistoryEntry[]; systemPrepended: boolean; currentMsgStartIdx: number } {
+): { history: KiroHistoryEntry[]; currentMsgStartIdx: number } {
   const history: KiroHistoryEntry[] = [];
-  let systemPrepended = false;
 
   // Walk backwards to find where the "current turn" begins.
   let currentMsgStartIdx = messages.length - 1;
@@ -279,11 +374,7 @@ export function buildHistory(
     if (!msg) continue;
 
     if (msg.role === "user") {
-      let content = typeof msg.content === "string" ? msg.content : getContentText(msg);
-      if (systemPrompt && !systemPrepended) {
-        content = `${systemPrompt}\n\n${content}`;
-        systemPrepended = true;
-      }
+      const content = typeof msg.content === "string" ? msg.content : getContentText(msg);
       const images = extractImages(msg);
       const uim: KiroUserInputMessage = {
         content,
@@ -305,76 +396,15 @@ export function buildHistory(
     }
 
     if (msg.role === "assistant") {
-      let armContent = "";
-      let armReasoningText = "";
-      let armReasoningSignature = "";
-      const armToolUses: KiroToolUse[] = [];
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "text") {
-            armContent += (block as TextContent).text;
-          } else if (block.type === "thinking") {
-            // Accumulate thinking text + signature for the reasoningContent
-            // field. Must NOT use inline <thinking> XML tags — Bedrock
-            // rejects replayed history with THINKING_SIGNATURE_INVALID when
-            // the signature is missing or corrupted.
-            const tb = block as ThinkingContent;
-            armReasoningText += tb.thinking;
-            if (tb.thinkingSignature) armReasoningSignature = tb.thinkingSignature;
-          } else if (block.type === "toolCall") {
-            const tc = block as ToolCall;
-            armToolUses.push({
-              name: tc.name,
-              toolUseId: toKiroToolUseId(tc.id),
-              input: parseToolArgs(tc.arguments),
-            });
-          }
-        }
-      }
-      const hasReasoning = armReasoningText.length > 0;
-      if (!armContent && armToolUses.length === 0 && !hasReasoning) continue;
-      // Only include reasoningContent when we have a valid signature.
-      // Bedrock rejects empty/missing signatures with THINKING_SIGNATURE_INVALID.
-      const reasoningContent = hasReasoning && armReasoningSignature
-        ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
-        : undefined;
-      history.push({
-        assistantResponseMessage: {
-          content: armContent,
-          ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
-          ...(reasoningContent ? { reasoningContent } : {}),
-        },
-      });
+      const arm = toKiroAssistant(msg);
+      if (arm) history.push({ assistantResponseMessage: arm });
       continue;
     }
 
     // toolResult — batch consecutive results
-    const trMsg = msg as ToolResultMessage;
-    const toolResults: KiroToolResult[] = [
-      {
-        content: [{ text: truncate(getContentText(msg), TOOL_RESULT_LIMIT) }],
-        status: trMsg.isError ? "error" : "success",
-        toolUseId: toKiroToolUseId(trMsg.toolCallId),
-      },
-    ];
-    const trImages: ImageContent[] = [];
-    if (Array.isArray(trMsg.content)) {
-      for (const c of trMsg.content) if (c.type === "image") trImages.push(c as ImageContent);
-    }
-
     let j = i + 1;
-    while (j < historyMessages.length && historyMessages[j]?.role === "toolResult") {
-      const next = historyMessages[j] as ToolResultMessage;
-      toolResults.push({
-        content: [{ text: truncate(getContentText(next), TOOL_RESULT_LIMIT) }],
-        status: next.isError ? "error" : "success",
-        toolUseId: toKiroToolUseId(next.toolCallId),
-      });
-      if (Array.isArray(next.content)) {
-        for (const c of next.content) if (c.type === "image") trImages.push(c as ImageContent);
-      }
-      j++;
-    }
+    while (j < historyMessages.length && historyMessages[j]?.role === "toolResult") j++;
+    const { toolResults, images: trImages } = toKiroToolResults(historyMessages.slice(i, j));
     i = j - 1;
 
     const prev = history[history.length - 1];
@@ -406,7 +436,7 @@ export function buildHistory(
     }
   }
 
-  return { history: sanitizeHistory(collapseAgenticLoops(history)), systemPrepended, currentMsgStartIdx };
+  return { history: sanitizeHistory(history), currentMsgStartIdx };
 }
 
 // ---- History sanitization ---------------------------------------------
@@ -466,73 +496,4 @@ export function sanitizeHistory(history: KiroHistoryEntry[]): KiroHistoryEntry[]
   }
 
   return history;
-}
-
-// ---- Agentic loop collapse --------------------------------------------
-
-/**
- * Collapse consecutive tool-use loops in history. When the agent calls
- * tools N times in sequence (ASST(toolUses) → USER(toolResults) pairs),
- * keep text only on the first assistant message and replace subsequent
- * ones with a short placeholder. This prevents the model from re-deriving
- * its preamble on every iteration, saving context tokens.
- */
-export function collapseAgenticLoops(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
-  if (history.length < 4) return history;
-
-  const result: KiroHistoryEntry[] = [];
-  let i = 0;
-
-  while (i < history.length) {
-    const entry = history[i];
-
-    // Detect start of agentic sequence:
-    // ASST with toolUses followed by USER with toolResults
-    if (
-      entry?.assistantResponseMessage?.toolUses &&
-      i + 1 < history.length &&
-      history[i + 1]?.userInputMessage?.userInputMessageContext?.toolResults
-    ) {
-      // Walk forward to find the end of the contiguous sequence
-      let j = i;
-      while (j < history.length) {
-        const asst = history[j];
-        if (!asst?.assistantResponseMessage?.toolUses) break;
-        const nextUser = j + 1 < history.length ? history[j + 1] : null;
-        if (!nextUser?.userInputMessage?.userInputMessageContext?.toolResults) break;
-        j += 2;
-      }
-
-      const pairCount = (j - i) / 2;
-
-      if (pairCount > 1) {
-        // Multi-iteration loop: keep full text on first pair only
-        for (let k = i; k < j; k += 2) {
-          const asst = history[k]!;
-          const user = history[k + 1]!;
-
-          if (k === i) {
-            result.push(asst);
-          } else {
-            result.push({
-              assistantResponseMessage: {
-                content: "[tool calling continues]",
-                toolUses: asst.assistantResponseMessage!.toolUses,
-              },
-            });
-          }
-          result.push(user);
-        }
-      } else {
-        // Single pair — keep as-is
-        result.push(history[i]!, history[i + 1]!);
-      }
-      i = j;
-    } else {
-      result.push(entry!);
-      i++;
-    }
-  }
-
-  return result;
 }

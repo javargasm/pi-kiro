@@ -14,7 +14,6 @@ export type KiroStreamEvent =
   | { type: "toolUseStop"; data: { stop: boolean } }
   | { type: "contextUsage"; data: { contextUsagePercentage: number } }
   | { type: "reasoning"; data: { text: string; signature?: string } }
-  | { type: "followupPrompt"; data: string }
   | { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
   | { type: "error"; data: { error: string; message?: string } }
   | { type: "metadata"; data: { stopReason?: string } };
@@ -112,10 +111,6 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
     };
   }
 
-  if (parsed.followupPrompt !== undefined) {
-    return { type: "followupPrompt", data: parsed.followupPrompt as string };
-  }
-
   if (parsed.error !== undefined || parsed.Error !== undefined) {
     const err = (parsed.error || parsed.Error || "unknown") as string | Record<string, unknown>;
     const message = (parsed.message || parsed.Message || parsed.reason) as string | undefined;
@@ -168,7 +163,7 @@ const EVENT_PATTERNS = [
   '{"stop":',
   '{"contextUsagePercentage":',
   '{"stopReason":',
-  '{"followupPrompt":',
+  '{"followupPrompt":', // consumed and ignored, so its nested content isn't scanned
   '{"usage":',
   '{"toolUseId":',
   '{"unit":',
